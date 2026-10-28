@@ -2,6 +2,7 @@
 package com.example.android_voice_assistant
 
 import android.Manifest
+import android.app.ActivityManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -56,9 +57,13 @@ class WakeWordService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    override fun onCreate() {
+        override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+
+        // Restore the chosen language if the service was restarted.
+        language = getSharedPreferences("hello_boss_prefs", MODE_PRIVATE)
+            .getString("language", "en-US") ?: "en-US"
     }
 
     override fun onStartCommand(
@@ -72,8 +77,12 @@ class WakeWordService : Service() {
             ACTION_STOP -> stopListeningService()
 
            ACTION_LANGUAGE -> {
-    language = intent?.getStringExtra(EXTRA_LANGUAGE) ?: "en-US"
+        language = intent?.getStringExtra(EXTRA_LANGUAGE) ?: "en-US"
 
+    getSharedPreferences("hello_boss_prefs", MODE_PRIVATE)
+        .edit()
+        .putString("language", language)
+        .apply()
     if (running.get() && !capturing.get()) {
         startWakeCapture()
     }
@@ -493,26 +502,135 @@ override fun onError(error: Int) {
 
     
 private fun closeRequestedApp(requested: String) {
-    val accessibility = VoiceAccessibilityService.instance
+    // Only apps the user selected can be closed; this reports its own
+    // errors (nothing selected / not selected / not found / ambiguous).
+    val target = resolveSelectedApp(requested, "close") ?: return
 
-    if (accessibility == null) {
-        report(
-            "error",
-            "Enable Hello Boss Voice Controls in Accessibility settings first."
-        )
+    val label = target.first
+    val pkg = target.second
+
+     val accessibility = VoiceAccessibilityService.instance
+    val front = accessibility?.foregroundPackage
+
+    Log.i(
+        TAG,
+        "Close $label ($pkg): front=$front, accessibility=${accessibility != null}"
+    )
+
+    // Android only lets us end an app that is NOT on screen. If the app is
+    // in front (or we can't tell which app is), go Home first, then close it.
+    val maybeInFront = front == null || front == pkg
+
+    if (accessibility != null && maybeInFront) {
+        if (!accessibility.goHome()) {
+            report("error", "Could not leave $label to close it")
+            return
+        }
+
+        mainHandler.postDelayed({ killApp(label, pkg) }, 1200)
         return
     }
 
-    if (accessibility.goBack()) {
-        report(
-            "status",
-            "Back action sent while closing $requested"
-        )
-    } else {
-        report("error", "Could not perform the Back action")
+    killApp(
+        label,
+        pkg,
+        if (accessibility == null) {
+            ". If it was on screen, turn on Hello Boss Voice Controls in Accessibility settings."
+        } else {
+            ""
+        }
+    )
+}
+
+private fun killApp(label: String, pkg: String, note: String = "") {
+    try {
+        val manager = getSystemService(ActivityManager::class.java)
+        manager.killBackgroundProcesses(pkg)
+        Log.i(TAG, "killBackgroundProcesses($pkg) called")
+        report("status", "Closed $label$note")
+    } catch (e: Exception) {
+        Log.e(TAG, "Could not close $label", e)
+        report("error", "Could not close $label: ${e.message}")
     }
 }
 
+/**
+ * Finds the ONE installed app the user asked for, but only among the apps
+ * they selected. Returns null (after reporting why) otherwise.
+ */
+private fun resolveSelectedApp(
+    requested: String,
+    verb: String
+): Triple<String, String, Intent>? {
+    val requestedName = normalize(requested)
+
+    if (requestedName.isBlank()) {
+        report("error", "Please say an app name")
+        return null
+    }
+
+    val allowed = AllowedApps.load(this)
+
+    if (allowed.isEmpty()) {
+        report(
+            "error",
+            "No apps are selected. Choose the apps Hello Boss may control first."
+        )
+        return null
+    }
+
+    return try {
+        val pm = packageManager
+
+        val candidates = pm.getInstalledApplications(
+            PackageManager.GET_META_DATA
+        ).mapNotNull { app ->
+            val launchIntent =
+                pm.getLaunchIntentForPackage(app.packageName)
+                    ?: return@mapNotNull null
+
+            Triple(
+                pm.getApplicationLabel(app).toString(),
+                app.packageName,
+                launchIntent
+            )
+        }
+
+        val matches = findMatches(
+            candidates.filter { it.second in allowed },
+            requestedName
+        )
+
+        when {
+            matches.size == 1 -> matches.first()
+
+            matches.size > 1 -> {
+                report(
+                    "error",
+                    "Multiple apps match '$requested'. Say the full app name."
+                )
+                null
+            }
+
+            findMatches(candidates, requestedName).isNotEmpty() -> {
+                report(
+                    "error",
+                    "$requested is not in your selected apps, so Hello Boss won't $verb it."
+                )
+                null
+            }
+
+            else -> {
+                report("error", "No app matched: $requested")
+                null
+            }
+        }
+    } catch (e: Exception) {
+        Log.e(TAG, "Could not look up $requested", e)
+        report("error", "Could not look up $requested: ${e.message}")
+        null
+    }
+}
 
     
 private fun goHome() {
@@ -553,6 +671,16 @@ private fun goHome() {
             return
         }
 
+                val allowed = AllowedApps.load(this)
+
+        if (allowed.isEmpty()) {
+            report(
+                "error",
+                "No apps are selected. Choose the apps Hello Boss may control first."
+            )
+            return
+        }
+        
         try {
             val pm = packageManager
 
@@ -568,18 +696,21 @@ private fun goHome() {
                 Triple(label, app.packageName, launchIntent)
             }
 
-            val exactMatches = candidates.filter {
-                normalize(it.first) == requestedName
+                        // Hello Boss may only control the apps the user selected.
+            val allowedCandidates = candidates.filter {
+                it.second in allowed
             }
 
-            val matches = if (exactMatches.isNotEmpty()) {
-                exactMatches
-            } else {
-                candidates.filter {
-                    val appName = normalize(it.first)
-                    appName.contains(requestedName) ||
-                        requestedName.contains(appName)
-                }
+            val matches = findMatches(allowedCandidates, requestedName)
+
+            if (matches.isEmpty() &&
+                findMatches(candidates, requestedName).isNotEmpty()
+            ) {
+                report(
+                    "error",
+                    "$requested is not in your selected apps, so Hello Boss won't open it."
+                )
+                return
             }
 
             when (matches.size) {
@@ -590,16 +721,13 @@ private fun goHome() {
                     )
                 }
 
-                1 -> {
+                                1 -> {
                     val selected = matches.first()
-                    selected.third.addFlags(
-                        Intent.FLAG_ACTIVITY_NEW_TASK
-                    )
 
-                    startActivity(selected.third)
-
-                    report("launched", selected.first)
-                    report("status", "Opened ${selected.first}")
+                    if (launchApp(selected.first, selected.third)) {
+                        report("launched", selected.first)
+                        report("status", "Opened ${selected.first}")
+                    }
                 }
 
                 else -> {
@@ -612,6 +740,84 @@ private fun goHome() {
         } catch (e: Exception) {
             Log.e(TAG, "Could not open app", e)
             report("error", "Could not open app: ${e.message}")
+        }
+    }
+
+        /**
+     * Starts [intent] even when another app is currently in the foreground.
+     *
+     * Android 10+ silently drops startActivity() calls from an app that has
+     * no visible window (a foreground service does not count). Hello Boss
+     * only has a visible window for the very first command, which is why the
+     * 2nd/3rd app never opened. Apps holding "Display over other apps"
+     * (SYSTEM_ALERT_WINDOW) are exempt, so we require it and tell the user
+     * how to grant it instead of failing silently.
+     */
+    private fun launchApp(label: String, intent: Intent): Boolean {
+        intent.addFlags(
+            Intent.FLAG_ACTIVITY_NEW_TASK or
+                Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+        )
+
+        val canStartFromBackground =
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.Q ||
+                Settings.canDrawOverlays(this)
+
+        if (!canStartFromBackground) {
+            // The launch may still work if Hello Boss happens to be visible,
+            // so try it, but make the missing permission obvious.
+            Log.w(TAG, "Overlay permission missing; background launch may be blocked")
+            report(
+                "error",
+                "Allow \"Display over other apps\" for Hello Boss so it can " +
+                    "open $label while another app is open."
+            )
+
+            try {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        android.net.Uri.parse("package:$packageName")
+                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Could not open overlay permission settings", e)
+            }
+
+            return false
+        }
+
+        return try {
+            // Prefer the accessibility service's context when it is enabled:
+            // it is bound by the system and is the most reliable launcher.
+            val launcher: android.content.Context =
+                VoiceAccessibilityService.instance ?: this
+
+            launcher.startActivity(intent)
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not launch $label", e)
+            report("error", "Could not open $label: ${e.message}")
+            false
+        }
+    }
+
+        /** Exact label match first, then partial match, within [pool]. */
+    private fun findMatches(
+        pool: List<Triple<String, String, Intent>>,
+        requestedName: String
+    ): List<Triple<String, String, Intent>> {
+        val exact = pool.filter { normalize(it.first) == requestedName }
+        if (exact.isNotEmpty()) return exact
+
+        return pool.filter {
+            val appName = normalize(it.first)
+
+            // A label with no a-z/0-9 characters (e.g. Nepali) normalizes
+            // to "" and would otherwise partially match every request.
+            appName.isNotEmpty() &&
+                (appName.contains(requestedName) ||
+                    requestedName.contains(appName))
         }
     }
 
@@ -643,7 +849,11 @@ private fun goHome() {
 
     if (!running.get()) return
 
-    report("status", "listening")
+        // Delay "listening" so the result of the command (Opened / Closed /
+    // error message) stays visible instead of being replaced instantly.
+    mainHandler.postDelayed({
+        if (running.get()) report("status", "listening")
+    }, 3000)
 
     mainHandler.postDelayed({
         if (!running.get()) return@postDelayed

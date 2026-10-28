@@ -7,6 +7,17 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+        <!--
+      Lets Hello Boss start another app while a different app is on screen.
+      Android 10+ silently blocks startActivity() from apps with no visible
+      window; "Display over other apps" is the documented exemption.
+    -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+        <!-- Lets Hello Boss close (end the background process of) selected apps. -->
+    <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
+        <!-- Lets Hello Boss keep listening when the phone's battery saver is on. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
 
     <application
         android:name="${applicationName}"
@@ -73,7 +84,12 @@
             <action android:name="android.intent.action.PROCESS_TEXT" />
             <data android:mimeType="text/plain" />
         </intent>
-
+                <!-- Every launchable app, so "open <app>" can find them (Android 11+) -->
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        
         <!-- Speech recognition service -->
         <intent>
             <action android:name="android.speech.RecognitionService" />

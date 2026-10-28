@@ -1,6 +1,5 @@
 import 'dart:async';
 
-import 'package:android_voice_assistant/widget/voice_area.dart';
 import 'package:android_voice_assistant/services/wake_word_bridge.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -36,6 +35,9 @@ class VoiceController extends ChangeNotifier {
   bool micOn = false;
   bool loading = false;
   String error = '';
+
+  /// Package names of the apps the user allowed Hello Boss to control.
+  Set<String> allowedPackages = <String>{};
 
   String _join(String a, String b) {
     if (a.trim().isEmpty) return b.trim();
@@ -208,7 +210,10 @@ class VoiceController extends ChangeNotifier {
       error = '';
       _notify();
 
-      final apps = await _getInstalledApps();
+      // Only apps the user selected in "Choose your apps" may be opened.
+      final apps = (await _getInstalledApps())
+          .where((app) => allowedPackages.contains(app.packageName))
+          .toList();
 
       if (_disposed) return;
 
@@ -487,22 +492,287 @@ class _SetupScreenState extends State<SetupScreen> {
   String selectedLanguage = 'English';
   bool rememberMe = true;
 
-  final List<AppItem> apps = [
-    AppItem('Phone', Icons.phone, Colors.green),
-    AppItem('Messages', Icons.message, Colors.blue),
-    AppItem('WhatsApp', Icons.chat, Colors.green),
-    AppItem('Gmail', Icons.mail, Colors.red),
-    AppItem('Settings', Icons.settings, Colors.blueGrey),
-    AppItem('Calendar', Icons.calendar_month, Colors.deepOrange),
-    AppItem('Music', Icons.music_note, Colors.purple),
-    AppItem('Contacts', Icons.contacts, Colors.teal),
-  ];
+  // Every launchable app on the phone, and which ones the user ticked.
+  // selectedApps holds PACKAGE NAMES (not display names).
+  List<_InstalledApp> installedApps = [];
+  final Set<String> selectedApps = {};
+  bool appsLoading = true;
+  String appSearch = '';
+  final TextEditingController _searchController = TextEditingController();
 
-  final Set<String> selectedApps = {'Phone', 'Messages', 'WhatsApp'};
+  List<_InstalledApp> get _visibleApps {
+    final query = appSearch.trim().toLowerCase();
+    if (query.isEmpty) return installedApps;
+
+    return installedApps
+        .where((app) => app.name.toLowerCase().contains(query))
+        .toList();
+  }
+
+  Future<void> _loadApps() async {
+    try {
+      final saved = await wakeWord.getAllowedApps();
+
+      final List<dynamic> all = await InstalledApps.getInstalledApps(
+        excludeSystemApps: false,
+        excludeNonLaunchableApps: true,
+      );
+
+      final list = <_InstalledApp>[
+        for (final dynamic app in all)
+          if (app.packageName != 'com.example.android_voice_assistant')
+            _InstalledApp(
+              (app.name ?? '').toString(),
+              app.packageName.toString(),
+            ),
+      ]..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+      // Forget saved apps that have since been uninstalled.
+      final installed = list.map((app) => app.packageName).toSet();
+      final stillInstalled = saved.where(installed.contains).toSet();
+
+      if (!mounted) return;
+
+      setState(() {
+        installedApps = list;
+        selectedApps
+          ..clear()
+          ..addAll(stillInstalled);
+        appsLoading = false;
+      });
+
+      voice.allowedPackages = {...selectedApps};
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        appsLoading = false;
+        wakeStatus = 'Could not load your apps: $e';
+      });
+    }
+  }
+
+  Widget _letterAvatar(_InstalledApp app, ColorScheme colors, double size) {
+    return CircleAvatar(
+      radius: size / 2,
+      backgroundColor: colors.primary.withAlpha(25),
+      foregroundColor: colors.primary,
+      child: Text(
+        app.name.isEmpty ? '?' : app.name.characters.first.toUpperCase(),
+      ),
+    );
+  }
+
+  // Icons are fetched natively one at a time, only for rows being shown,
+  // and cached here so scrolling doesn't reload them.
+  final Map<String, Future<Uint8List?>> _iconFutures = {};
+
+  // The app's real launcher icon; falls back to its first letter.
+  Widget _appIcon(_InstalledApp app, ColorScheme colors, {double size = 42}) {
+    final future = _iconFutures.putIfAbsent(
+      app.packageName,
+      () => wakeWord.getAppIcon(app.packageName).catchError((Object _) => null),
+    );
+
+    return FutureBuilder<Uint8List?>(
+      future: future,
+      builder: (context, snapshot) {
+        final icon = snapshot.data;
+
+        if (icon == null || icon.isEmpty) {
+          return _letterAvatar(app, colors, size);
+        }
+
+        return ClipRRect(
+          borderRadius: BorderRadius.circular(size * 0.25),
+          child: Image.memory(
+            icon,
+            width: size,
+            height: size,
+            fit: BoxFit.cover,
+            gaplessPlayback: true,
+            errorBuilder: (_, _, _) => _letterAvatar(app, colors, size),
+          ),
+        );
+      },
+    );
+  }
+
+  // Horizontal strip of the apps already selected, with a remove button.
+  Widget _selectedAppsStrip(ColorScheme colors) {
+    final chosen = installedApps
+        .where((app) => selectedApps.contains(app.packageName))
+        .toList();
+
+    if (chosen.isEmpty) {
+      return Text(
+        'No apps selected yet.',
+        style: TextStyle(fontSize: 13, color: Colors.grey.shade600),
+      );
+    }
+
+    return SizedBox(
+      height: 92,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.only(top: 8, right: 8),
+        itemCount: chosen.length,
+        separatorBuilder: (_, _) => const SizedBox(width: 14),
+        itemBuilder: (context, index) {
+          final app = chosen[index];
+
+          return SizedBox(
+            width: 62,
+            child: Column(
+              children: [
+                Stack(
+                  clipBehavior: Clip.none,
+                  children: [
+                    _appIcon(app, colors, size: 48),
+                    Positioned(
+                      right: -6,
+                      top: -6,
+                      child: GestureDetector(
+                        onTap: () {
+                          setState(() {
+                            selectedApps.remove(app.packageName);
+                          });
+                          _saveSelection();
+                        },
+                        child: Container(
+                          padding: const EdgeInsets.all(2),
+                          decoration: BoxDecoration(
+                            color: Colors.grey.shade700,
+                            shape: BoxShape.circle,
+                          ),
+                          child: const Icon(
+                            Icons.close,
+                            size: 12,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  app.name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(fontSize: 11),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  // "Get Started": set everything up, start the background listener, then
+  // close this screen. The listener is a foreground service, so it keeps
+  // working after this screen closes or is cleared from Recents.
+  Future<void> _getStarted() async {
+    // Can't start without at least one selected app.
+    if (selectedApps.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please select at least one app.')),
+      );
+      return;
+    }
+
+    setState(() {
+      wakeBusy = true;
+    });
+
+    try {
+      final mic = await Permission.microphone.request();
+
+      if (!mic.isGranted) {
+        if (!mounted) return;
+
+        setState(() {
+          wakeStatus = mic.isPermanentlyDenied
+              ? 'Microphone permission is permanently denied.'
+              : 'Microphone permission is required.';
+        });
+
+        if (mic.isPermanentlyDenied) {
+          await openAppSettings();
+        }
+        return;
+      }
+
+      // Ask for these, but don't block Get Started if they are declined.
+      await Permission.notification.request();
+
+      if (!await Permission.systemAlertWindow.isGranted) {
+        await Permission.systemAlertWindow.request();
+      }
+
+      // Stops battery saving from killing the listener in the background.
+      if (!await Permission.ignoreBatteryOptimizations.isGranted) {
+        await Permission.ignoreBatteryOptimizations.request();
+      }
+
+      await wakeWord.setAllowedApps(selectedApps);
+      await wakeWord.setLanguage(selectedLanguage);
+      await wakeWord.start();
+
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Hello Boss is listening in the background.'),
+        ),
+      );
+
+      // Let the message show for a moment, then close this screen.
+      await Future<void>.delayed(const Duration(milliseconds: 900));
+      await SystemNavigator.pop();
+    } on PlatformException catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        wakeStatus = e.message ?? 'Could not start Hello Boss';
+        backgroundListening = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        wakeStatus = 'Error: $e';
+        backgroundListening = false;
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          wakeBusy = false;
+        });
+      }
+    }
+  }
+
+  // Saved natively so the background service enforces it immediately.
+  void _saveSelection() {
+    voice.allowedPackages = {...selectedApps};
+
+    unawaited(
+      wakeWord.setAllowedApps(selectedApps).catchError((Object e) {
+        if (!mounted) return;
+
+        setState(() {
+          wakeStatus = 'Could not save app selection: $e';
+        });
+      }),
+    );
+  }
 
   @override
   void initState() {
     super.initState();
+    unawaited(_loadApps());
 
     wakeSubscription = wakeWord.events.listen(
       (event) {
@@ -563,9 +833,10 @@ class _SetupScreenState extends State<SetupScreen> {
   @override
   void dispose() {
     wakeSubscription?.cancel();
-    unawaited(wakeWord.stop());
+
     voice.dispose();
     super.dispose();
+    _searchController.dispose();
   }
 
   @override
@@ -685,68 +956,110 @@ class _SetupScreenState extends State<SetupScreen> {
                 ),
 
                 const SizedBox(height: 4),
-
                 Text(
-                  'Select the apps Hello Boss can help you with.',
+                  'Hello Boss will only open and control the apps you tick here.',
                   style: TextStyle(fontSize: 13, color: Colors.grey.shade700),
                 ),
 
                 const SizedBox(height: 10),
 
+                _selectedAppsStrip(colors),
+
+                const SizedBox(height: 12),
+
+                TextField(
+                  controller: _searchController,
+                  decoration: InputDecoration(
+                    hintText: 'Search apps',
+                    prefixIcon: const Icon(Icons.search),
+                    suffixIcon: appSearch.isEmpty
+                        ? null
+                        : IconButton(
+                            tooltip: 'Clear',
+                            icon: const Icon(Icons.close),
+                            onPressed: () {
+                              _searchController.clear();
+                              FocusScope.of(context).unfocus();
+                              setState(() {
+                                appSearch = '';
+                              });
+                            },
+                          ),
+                    filled: true,
+                    fillColor: Colors.white,
+                    contentPadding: const EdgeInsets.symmetric(vertical: 0),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(16),
+                      borderSide: BorderSide.none,
+                    ),
+                  ),
+                  onChanged: (value) {
+                    setState(() {
+                      appSearch = value;
+                    });
+                  },
+                ),
+
+                const SizedBox(height: 10),
+
                 Container(
-                  height: 150,
+                  height: 300,
                   decoration: BoxDecoration(
                     color: Colors.white,
                     borderRadius: BorderRadius.circular(16),
                   ),
-                  child: ListView.separated(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 22,
-                      vertical: 5,
-                    ),
-                    itemCount: apps.length,
-                    separatorBuilder: (_, _) =>
-                        Divider(height: 1, color: Colors.grey.shade200),
-                    itemBuilder: (context, index) {
-                      final app = apps[index];
-                      final isSelected = selectedApps.contains(app.name);
-
-                      return CheckboxListTile(
-                        contentPadding: EdgeInsets.zero,
-                        controlAffinity: ListTileControlAffinity.trailing,
-                        secondary: Container(
-                          width: 42,
-                          height: 42,
-                          decoration: BoxDecoration(
-                            color: app.color.withAlpha(25),
-                            borderRadius: BorderRadius.circular(12),
+                  child: appsLoading
+                      ? const Center(child: CircularProgressIndicator())
+                      : _visibleApps.isEmpty
+                      ? Center(
+                          child: Text(
+                            installedApps.isEmpty
+                                ? 'No apps found.'
+                                : 'No app matches "$appSearch".',
+                            style: TextStyle(color: Colors.grey.shade600),
                           ),
-                          child: Icon(app.icon, color: app.color, size: 24),
+                        )
+                      : ListView.separated(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 22,
+                            vertical: 5,
+                          ),
+                          itemCount: _visibleApps.length,
+                          separatorBuilder: (_, _) =>
+                              Divider(height: 1, color: Colors.grey.shade200),
+                          itemBuilder: (context, index) {
+                            final app = _visibleApps[index];
+                            final isSelected = selectedApps.contains(
+                              app.packageName,
+                            );
+
+                            return CheckboxListTile(
+                              contentPadding: EdgeInsets.zero,
+                              controlAffinity: ListTileControlAffinity.trailing,
+                              secondary: _appIcon(app, colors),
+                              title: Text(
+                                app.name,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w500,
+                                ),
+                              ),
+                              value: isSelected,
+                              activeColor: colors.primary,
+                              onChanged: (checked) {
+                                setState(() {
+                                  if (checked == true) {
+                                    selectedApps.add(app.packageName);
+                                  } else {
+                                    selectedApps.remove(app.packageName);
+                                  }
+                                });
+
+                                _saveSelection();
+                              },
+                            );
+                          },
                         ),
-                        title: Text(
-                          app.name,
-                          style: const TextStyle(fontWeight: FontWeight.w500),
-                        ),
-                        value: isSelected,
-                        activeColor: colors.primary,
-                        onChanged: (checked) {
-                          setState(() {
-                            if (checked == true) {
-                              selectedApps.add(app.name);
-                            } else {
-                              selectedApps.remove(app.name);
-                            }
-                          });
-                        },
-                      );
-                    },
-                  ),
                 ),
-
-                const SizedBox(height: 16),
-
-                // VoiceArea(voice: voice, colors: colors),
-                const SizedBox(height: 16),
 
                 Card(
                   child: Padding(
@@ -799,6 +1112,24 @@ class _SetupScreenState extends State<SetupScreen> {
                                 onPressed: wakeBusy || backgroundListening
                                     ? null
                                     : () async {
+                                        // Hello Boss can't run without apps.
+                                        if (selectedApps.isEmpty) {
+                                          setState(() {
+                                            wakeStatus =
+                                                'Select at least one app first.';
+                                          });
+
+                                          ScaffoldMessenger.of(
+                                            context,
+                                          ).showSnackBar(
+                                            const SnackBar(
+                                              content: Text(
+                                                'Please select at least one app.',
+                                              ),
+                                            ),
+                                          );
+                                          return;
+                                        }
                                         setState(() {
                                           wakeBusy = true;
                                         });
@@ -822,6 +1153,15 @@ class _SetupScreenState extends State<SetupScreen> {
                                               await openAppSettings();
                                             }
                                             return;
+                                          }
+                                          // Needed so Hello Boss can open an app
+                                          // while another app is on screen
+                                          // (Android blocks background launches).
+                                          if (!await Permission
+                                              .systemAlertWindow
+                                              .isGranted) {
+                                            await Permission.systemAlertWindow
+                                                .request();
                                           }
 
                                           await wakeWord.setLanguage(
@@ -940,27 +1280,7 @@ class _SetupScreenState extends State<SetupScreen> {
                   width: double.infinity,
                   height: 54,
                   child: FilledButton.icon(
-                    onPressed: () {
-                      if (selectedApps.isEmpty) {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(
-                            content: Text('Please select at least one app.'),
-                          ),
-                        );
-                        return;
-                      }
-
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(
-                          content: Text(
-                            'Language: $selectedLanguage | '
-                            'Apps selected: ${selectedApps.length} | '
-                            'Remember me: '
-                            '${rememberMe ? "Yes" : "No"}',
-                          ),
-                        ),
-                      );
-                    },
+                    onPressed: wakeBusy ? null : _getStarted,
                     icon: const Icon(Icons.arrow_forward),
                     label: const Text(
                       'Get Started',
@@ -982,10 +1302,10 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 }
 
-class AppItem {
+class _InstalledApp {
   final String name;
-  final IconData icon;
-  final Color color;
+  final String packageName;
+  final Uint8List? icon;
 
-  const AppItem(this.name, this.icon, this.color);
+  const _InstalledApp(this.name, this.packageName, [this.icon]);
 }

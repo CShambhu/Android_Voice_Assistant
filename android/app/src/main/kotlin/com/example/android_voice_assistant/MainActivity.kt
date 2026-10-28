@@ -2,6 +2,9 @@
 package com.example.android_voice_assistant
 
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.drawable.Drawable
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -9,8 +12,31 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
+import java.io.ByteArrayOutputStream
+import java.util.concurrent.Executors
 
 class MainActivity : FlutterActivity() {
+
+    private val iconExecutor = Executors.newFixedThreadPool(2)
+
+    // Renders any icon (including adaptive icons) to PNG bytes.
+    private fun drawableToPng(drawable: Drawable, size: Int): ByteArray {
+        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        drawable.setBounds(0, 0, size, size)
+        drawable.draw(canvas)
+
+        val out = ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+        bitmap.recycle()
+
+        return out.toByteArray()
+    }
+
+    override fun onDestroy() {
+        iconExecutor.shutdown()
+        super.onDestroy()
+    }
 
     companion object {
         private var eventSink: EventChannel.EventSink? = null
@@ -109,6 +135,40 @@ class MainActivity : FlutterActivity() {
 
                     startService(intent)
                     result.success(null)
+                }
+
+                "setAllowedApps" -> {
+                    val packages = call.argument<List<String>>("packages")
+                        ?: emptyList()
+
+                    AllowedApps.save(this, packages.toSet())
+                    result.success(null)
+                }
+
+                "getAllowedApps" -> {
+                    result.success(AllowedApps.load(this).toList())
+                }
+
+                "getAppIcon" -> {
+                    val pkg = call.argument<String>("package")
+
+                    if (pkg == null) {
+                        result.success(null)
+                    } else {
+                        // Draw off the main thread, reply on it.
+                        iconExecutor.execute {
+                            val png = try {
+                                drawableToPng(
+                                    packageManager.getApplicationIcon(pkg),
+                                    128
+                                )
+                            } catch (e: Exception) {
+                                null
+                            }
+
+                            runOnUiThread { result.success(png) }
+                        }
+                    }
                 }
 
                 else -> result.notImplemented()

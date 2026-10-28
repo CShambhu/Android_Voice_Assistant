@@ -25,6 +25,25 @@ class WakeWordBridge {
     await _methods.invokeMethod<void>('stop');
   }
 
+  /// Package names of the apps Hello Boss is allowed to control.
+  Future<List<String>> getAllowedApps() async {
+    final result = await _methods.invokeListMethod<String>('getAllowedApps');
+    return result ?? <String>[];
+  }
+
+  /// The app's launcher icon as PNG bytes, or null if unavailable.
+  Future<Uint8List?> getAppIcon(String packageName) async {
+    return _methods.invokeMethod<Uint8List>('getAppIcon', {
+      'package': packageName,
+    });
+  }
+
+  Future<void> setAllowedApps(Iterable<String> packages) async {
+    await _methods.invokeMethod<void>('setAllowedApps', {
+      'packages': packages.toList(),
+    });
+  }
+
   Future<void> setLanguage(String language) async {
     final locale = switch (language) {
       'Nepali' => 'ne-NP',
