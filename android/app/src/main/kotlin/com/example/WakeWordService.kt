@@ -39,6 +39,17 @@ class WakeWordService : Service() {
         private const val CHANNEL_ID = "hello_boss_listener"
         private const val NOTIFICATION_ID = 4101
         private const val TAG = "WakeWordService"
+
+        // Wake-word strictness (0..1). 0.90 is the SDK's tested default:
+        // ~0.5% false triggers, ~98% of real "Hey Assistant" caught.
+        // Lower (0.85) hears you more easily but triggers on noise more;
+        // higher (0.95) is stricter but misses ~1 in 4 real wake words.
+        private const val WAKE_THRESHOLD = 0.90f
+
+        /** True while the listener is really running (read by the UI). */
+        @Volatile
+        var isActive: Boolean = false
+            private set
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -57,7 +68,7 @@ class WakeWordService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-        override fun onCreate() {
+    override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
 
@@ -76,23 +87,29 @@ class WakeWordService : Service() {
 
             ACTION_STOP -> stopListeningService()
 
-           ACTION_LANGUAGE -> {
-        language = intent?.getStringExtra(EXTRA_LANGUAGE) ?: "en-US"
+            ACTION_LANGUAGE -> {
+                language = intent?.getStringExtra(EXTRA_LANGUAGE) ?: "en-US"
 
-    getSharedPreferences("hello_boss_prefs", MODE_PRIVATE)
-        .edit()
-        .putString("language", language)
-        .apply()
-    if (running.get() && !capturing.get()) {
-        startWakeCapture()
-    }
-}
+                getSharedPreferences("hello_boss_prefs", MODE_PRIVATE)
+                    .edit()
+                    .putString("language", language)
+                    .apply()
+
+                if (running.get() && !capturing.get()) {
+                    startWakeCapture()
+                }
+            }
         }
 
-        return START_NOT_STICKY
+        // STICKY: if Android kills the process (e.g. when the app is cleared
+        // from Recents on some phones), ask it to restart the listener.
+        return START_STICKY
     }
 
-    private fun startListeningService() {
+
+
+
+      private fun startListeningService() {
         if (!running.compareAndSet(false, true)) return
 
         if (
@@ -102,6 +119,8 @@ class WakeWordService : Service() {
             ) != PackageManager.PERMISSION_GRANTED
         ) {
             running.set(false)
+            isActive = false
+            report("status", "stopped")
             report("error", "Microphone permission has not been granted")
             stopSelf()
             return
@@ -113,15 +132,19 @@ class WakeWordService : Service() {
                 buildNotification()
             )
 
+            isActive = true
             report("status", "listening")
             startWakeCapture()
         } catch (e: Exception) {
             Log.e(TAG, "Could not start foreground service", e)
             running.set(false)
+            isActive = false
+            report("status", "stopped")
             report("error", "Service startup failed: ${e.message}")
             stopSelf()
         }
     }
+
 
     private fun startWakeCapture() {
         if (!running.get()) return
@@ -137,7 +160,7 @@ class WakeWordService : Service() {
                 "voxrt_wake_word.vxrt"
             )
 
-            engine.setThreshold(0.80f)
+                        engine.setThreshold(WAKE_THRESHOLD)
 engine.setCooldownFrames(100)
 
             val sampleRate = 16000
@@ -867,6 +890,7 @@ private fun goHome() {
 }
 
     private fun stopListeningService() {
+                isActive = false
         running.set(false)
         capturing.set(false)
 
@@ -930,6 +954,7 @@ private fun goHome() {
     }
 
     override fun onDestroy() {
+                isActive = false
         running.set(false)
         capturing.set(false)
 

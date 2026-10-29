@@ -36,7 +36,7 @@ class VoiceController extends ChangeNotifier {
   bool loading = false;
   String error = '';
 
-  /// Package names of the apps the user allowed Hello Boss to control.
+  /// Package names of the apps the user allowed Voice Assistant to control.
   Set<String> allowedPackages = <String>{};
 
   String _join(String a, String b) {
@@ -455,7 +455,7 @@ class HelloBossApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Hello Boss',
+      title: 'Voice Assistant',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
@@ -511,22 +511,22 @@ class _SetupScreenState extends State<SetupScreen> {
 
   Future<void> _loadApps() async {
     try {
-      final saved = await wakeWord.getAllowedApps();
+      // Start both lookups at once instead of one after the other.
+      final savedFuture = wakeWord.getAllowedApps();
+      final appsFuture = wakeWord.getLaunchableApps();
 
-      final List<dynamic> all = await InstalledApps.getInstalledApps(
-        excludeSystemApps: false,
-        excludeNonLaunchableApps: true,
-      );
+      final saved = await savedFuture;
+      final all = await appsFuture;
 
-      final list = <_InstalledApp>[
-        for (final dynamic app in all)
-          if (app.packageName != 'com.example.android_voice_assistant')
-            _InstalledApp(
-              (app.name ?? '').toString(),
-              app.packageName.toString(),
-            ),
-      ]..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
-      // Forget saved apps that have since been uninstalled.
+      final list =
+          <_InstalledApp>[
+            for (final app in all)
+              if (app['package']!.isNotEmpty &&
+                  app['package'] != 'com.example.android_voice_assistant')
+                _InstalledApp(app['name']!, app['package']!),
+          ]..sort(
+            (a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()),
+          ); // Forget saved apps that have since been uninstalled.
       final installed = list.map((app) => app.packageName).toSet();
       final stillInstalled = saved.where(installed.contains).toSet();
 
@@ -724,7 +724,7 @@ class _SetupScreenState extends State<SetupScreen> {
 
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Hello Boss is listening in the background.'),
+          content: Text('Voice Assistant is listening in the background.'),
         ),
       );
 
@@ -735,7 +735,7 @@ class _SetupScreenState extends State<SetupScreen> {
       if (!mounted) return;
 
       setState(() {
-        wakeStatus = e.message ?? 'Could not start Hello Boss';
+        wakeStatus = e.message ?? 'Could not start Voice Assistant';
         backgroundListening = false;
       });
     } catch (e) {
@@ -769,10 +769,146 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
+  // One button: turns the microphone (wake-word listening) on or off.
+  Future<void> _toggleMicrophone() async {
+    if (wakeBusy) return;
+
+    if (backgroundListening) {
+      await _turnMicOff();
+    } else {
+      await _turnMicOn();
+    }
+  }
+
+  Future<void> _turnMicOn() async {
+    // Hello Boss can't run without apps.
+    if (selectedApps.isEmpty) {
+      setState(() {
+        wakeStatus = 'Select at least one app first.';
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please select at least one app.')),
+      );
+      return;
+    }
+
+    setState(() {
+      wakeBusy = true;
+    });
+
+    try {
+      final status = await Permission.microphone.request();
+
+      if (!status.isGranted) {
+        if (!mounted) return;
+
+        setState(() {
+          wakeStatus = status.isPermanentlyDenied
+              ? 'Microphone permission is permanently denied.'
+              : 'Microphone permission is required.';
+        });
+
+        if (status.isPermanentlyDenied) {
+          await openAppSettings();
+        }
+        return;
+      }
+
+      // Needed so Hello Boss can open an app while another app is on screen
+      // (Android blocks background launches).
+      if (!await Permission.systemAlertWindow.isGranted) {
+        await Permission.systemAlertWindow.request();
+      }
+
+      await wakeWord.setAllowedApps(selectedApps);
+      await wakeWord.setLanguage(selectedLanguage);
+      await wakeWord.start();
+
+      if (!mounted) return;
+
+      setState(() {
+        backgroundListening = true;
+        wakeStatus = 'Starting listener...';
+      });
+    } on PlatformException catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        wakeStatus = e.message ?? 'Could not turn on the microphone';
+        backgroundListening = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        wakeStatus = 'Error: $e';
+        backgroundListening = false;
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          wakeBusy = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _turnMicOff() async {
+    setState(() {
+      wakeBusy = true;
+    });
+
+    try {
+      // Stop the native wake-word service.
+      await wakeWord.stop();
+
+      // Also stop Flutter speech recognition.
+      await voice.setMic(false);
+
+      if (!mounted) return;
+
+      setState(() {
+        backgroundListening = false;
+        wakeStatus = 'Microphone turned off';
+      });
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        wakeStatus = 'Could not turn off microphone: $e';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          wakeBusy = false;
+        });
+      }
+    }
+  }
+
+  // The listener may already be running (e.g. started with Get Started and
+  // this screen reopened), so ask it instead of assuming "off".
+  Future<void> _syncListeningState() async {
+    try {
+      final on = await wakeWord.isListening();
+
+      if (!mounted) return;
+
+      setState(() {
+        backgroundListening = on;
+        if (on) wakeStatus = 'listening';
+      });
+    } catch (_) {
+      // Keep the default (off) if the service can't be asked.
+    }
+  }
+
   @override
   void initState() {
     super.initState();
     unawaited(_loadApps());
+    unawaited(_syncListeningState());
 
     wakeSubscription = wakeWord.events.listen(
       (event) {
@@ -785,9 +921,12 @@ class _SetupScreenState extends State<SetupScreen> {
           switch (type) {
             case 'status':
               wakeStatus = value;
-              backgroundListening = value == 'listening' || value == 'command';
 
-              if (value == 'stopped') {
+              // Only these change whether the mic is on. Other messages
+              // (e.g. "Opened WhatsApp") must not flip the button.
+              if (value == 'listening' || value == 'command') {
+                backgroundListening = true;
+              } else if (value == 'stopped') {
                 backgroundListening = false;
               }
               break;
@@ -807,8 +946,9 @@ class _SetupScreenState extends State<SetupScreen> {
               break;
 
             case 'error':
+              // An error message doesn't mean the mic turned off; the
+              // service reports 'stopped' when it really stops.
               wakeStatus = value;
-              backgroundListening = false;
               break;
           }
         });
@@ -870,7 +1010,7 @@ class _SetupScreenState extends State<SetupScreen> {
                       ),
                       const SizedBox(height: 12),
                       Text(
-                        'Hello Boss',
+                        'Voice Assistant',
                         style: TextStyle(
                           fontSize: 30,
                           fontWeight: FontWeight.bold,
@@ -957,7 +1097,7 @@ class _SetupScreenState extends State<SetupScreen> {
 
                 const SizedBox(height: 4),
                 Text(
-                  'Hello Boss will only open and control the apps you tick here.',
+                  'Voice Assistant will only open and control the apps you tick here.',
                   style: TextStyle(fontSize: 13, color: Colors.grey.shade700),
                 ),
 
@@ -1104,152 +1244,27 @@ class _SetupScreenState extends State<SetupScreen> {
                         ],
 
                         const SizedBox(height: 14),
-
-                        Row(
-                          children: [
-                            Expanded(
-                              child: FilledButton.icon(
-                                onPressed: wakeBusy || backgroundListening
-                                    ? null
-                                    : () async {
-                                        // Hello Boss can't run without apps.
-                                        if (selectedApps.isEmpty) {
-                                          setState(() {
-                                            wakeStatus =
-                                                'Select at least one app first.';
-                                          });
-
-                                          ScaffoldMessenger.of(
-                                            context,
-                                          ).showSnackBar(
-                                            const SnackBar(
-                                              content: Text(
-                                                'Please select at least one app.',
-                                              ),
-                                            ),
-                                          );
-                                          return;
-                                        }
-                                        setState(() {
-                                          wakeBusy = true;
-                                        });
-
-                                        try {
-                                          final status = await Permission
-                                              .microphone
-                                              .request();
-
-                                          if (!status.isGranted) {
-                                            if (!mounted) return;
-
-                                            setState(() {
-                                              wakeStatus =
-                                                  status.isPermanentlyDenied
-                                                  ? 'Microphone permission is permanently denied.'
-                                                  : 'Microphone permission is required.';
-                                            });
-
-                                            if (status.isPermanentlyDenied) {
-                                              await openAppSettings();
-                                            }
-                                            return;
-                                          }
-                                          // Needed so Hello Boss can open an app
-                                          // while another app is on screen
-                                          // (Android blocks background launches).
-                                          if (!await Permission
-                                              .systemAlertWindow
-                                              .isGranted) {
-                                            await Permission.systemAlertWindow
-                                                .request();
-                                          }
-
-                                          await wakeWord.setLanguage(
-                                            selectedLanguage,
-                                          );
-                                          await wakeWord.start();
-
-                                          if (!mounted) return;
-
-                                          setState(() {
-                                            wakeStatus = 'Starting listener...';
-                                          });
-                                        } on PlatformException catch (e) {
-                                          if (!mounted) return;
-
-                                          setState(() {
-                                            wakeStatus =
-                                                e.message ??
-                                                'Could not start listening';
-                                            backgroundListening = false;
-                                          });
-                                        } catch (e) {
-                                          if (!mounted) return;
-
-                                          setState(() {
-                                            wakeStatus = 'Error: $e';
-                                            backgroundListening = false;
-                                          });
-                                        } finally {
-                                          if (mounted) {
-                                            setState(() {
-                                              wakeBusy = false;
-                                            });
-                                          }
-                                        }
-                                      },
-                                icon: const Icon(Icons.mic),
-                                label: const Text('Start listening'),
-                              ),
+                        SizedBox(
+                          width: double.infinity,
+                          child: FilledButton.icon(
+                            style: FilledButton.styleFrom(
+                              backgroundColor: backgroundListening
+                                  ? Colors.red.shade700
+                                  : null,
+                              foregroundColor: backgroundListening
+                                  ? Colors.white
+                                  : null,
                             ),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: FilledButton.icon(
-                                style: FilledButton.styleFrom(
-                                  backgroundColor: Colors.red.shade700,
-                                  foregroundColor: Colors.white,
-                                ),
-                                onPressed: wakeBusy
-                                    ? null
-                                    : () async {
-                                        setState(() {
-                                          wakeBusy = true;
-                                        });
-
-                                        try {
-                                          // Stop the native wake-word service.
-                                          await wakeWord.stop();
-
-                                          // Also stop Flutter speech recognition.
-                                          await voice.setMic(false);
-
-                                          if (!mounted) return;
-
-                                          setState(() {
-                                            backgroundListening = false;
-                                            wakeStatus =
-                                                'Microphone turned off';
-                                          });
-                                        } catch (e) {
-                                          if (!mounted) return;
-
-                                          setState(() {
-                                            wakeStatus =
-                                                'Could not turn off microphone: $e';
-                                          });
-                                        } finally {
-                                          if (mounted) {
-                                            setState(() {
-                                              wakeBusy = false;
-                                            });
-                                          }
-                                        }
-                                      },
-                                icon: const Icon(Icons.mic_off),
-                                label: const Text('Turn off microphone'),
-                              ),
+                            onPressed: wakeBusy ? null : _toggleMicrophone,
+                            icon: Icon(
+                              backgroundListening ? Icons.mic_off : Icons.mic,
                             ),
-                          ],
+                            label: Text(
+                              backgroundListening
+                                  ? 'Turn off microphone'
+                                  : 'Turn on microphone',
+                            ),
+                          ),
                         ),
                       ],
                     ),

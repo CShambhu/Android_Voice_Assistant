@@ -31,6 +31,26 @@ class WakeWordBridge {
     return result ?? <String>[];
   }
 
+  /// Whether the background listener is running right now.
+  Future<bool> isListening() async {
+    return await _methods.invokeMethod<bool>('isListening') ?? false;
+  }
+
+  /// Every launchable app as {'name': ..., 'package': ...} (fast, native).
+  Future<List<Map<String, String>>> getLaunchableApps() async {
+    final result = await _methods.invokeListMethod<Map<dynamic, dynamic>>(
+      'getLaunchableApps',
+    );
+
+    return [
+      for (final app in result ?? const <Map<dynamic, dynamic>>[])
+        {
+          'name': (app['name'] ?? '').toString(),
+          'package': (app['package'] ?? '').toString(),
+        },
+    ];
+  }
+
   /// The app's launcher icon as PNG bytes, or null if unavailable.
   Future<Uint8List?> getAppIcon(String packageName) async {
     return _methods.invokeMethod<Uint8List>('getAppIcon', {

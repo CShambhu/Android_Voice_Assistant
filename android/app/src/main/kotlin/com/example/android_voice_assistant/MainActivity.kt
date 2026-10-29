@@ -149,6 +149,36 @@ class MainActivity : FlutterActivity() {
                     result.success(AllowedApps.load(this).toList())
                 }
 
+                                "isListening" -> {
+                    result.success(WakeWordService.isActive)
+                }
+
+                                "getLaunchableApps" -> {
+                    // One fast PackageManager query instead of the slow
+                    // plugin scan; runs off the main thread.
+                    iconExecutor.execute {
+                        val apps = try {
+                            val pm = packageManager
+
+                            val launcher = Intent(Intent.ACTION_MAIN)
+                                .addCategory(Intent.CATEGORY_LAUNCHER)
+
+                            pm.queryIntentActivities(launcher, 0)
+                                .distinctBy { it.activityInfo.packageName }
+                                .map {
+                                    mapOf(
+                                        "name" to it.loadLabel(pm).toString(),
+                                        "package" to it.activityInfo.packageName
+                                    )
+                                }
+                        } catch (e: Exception) {
+                            emptyList()
+                        }
+
+                        runOnUiThread { result.success(apps) }
+                    }
+                }
+
                 "getAppIcon" -> {
                     val pkg = call.argument<String>("package")
 
