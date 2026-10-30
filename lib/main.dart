@@ -8,6 +8,8 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
+import 'package:android_voice_assistant/screens/guide_screens.dart';
+import 'package:android_voice_assistant/services/accessibility_bridge.dart';
 
 void main() {
   runApp(const HelloBossApp());
@@ -476,9 +478,11 @@ class SetupScreen extends StatefulWidget {
   State<SetupScreen> createState() => _SetupScreenState();
 }
 
-class _SetupScreenState extends State<SetupScreen> {
+class _SetupScreenState extends State<SetupScreen> with WidgetsBindingObserver {
   final VoiceController voice = VoiceController();
   final WakeWordBridge wakeWord = WakeWordBridge();
+  final AccessibilityBridge accessibility = AccessibilityBridge();
+  bool _waitingForAccessibility = false;
 
   StreamSubscription<Map<String, dynamic>>? wakeSubscription;
 
@@ -507,6 +511,101 @@ class _SetupScreenState extends State<SetupScreen> {
     return installedApps
         .where((app) => app.name.toLowerCase().contains(query))
         .toList();
+  }
+
+  // Continue setup automatically when the user returns from Settings.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && _waitingForAccessibility) {
+      _waitingForAccessibility = false;
+
+      accessibility.isEnabled().then((enabled) {
+        if (enabled && mounted && !wakeBusy) {
+          unawaited(_getStarted());
+        }
+      });
+    }
+  }
+
+  // Returns true only when Accessibility is already ON.
+  // Otherwise explains the steps, opens Settings, and returns false.
+  Future<bool> _ensureAccessibility() async {
+    if (await accessibility.isEnabled()) return true;
+    if (!mounted) return false;
+
+    final choice = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text('Turn on Accessibility'),
+        content: const Text(
+          'Accessibility is needed so Voice Assistant can control your '
+          'selected apps.\n\n'
+          'Settings > Accessibility > Installed apps > '
+          'Hello Boss Voice Controls > turn ON > Allow.',
+        ),
+
+        actionsPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+        actions: [
+          Row(
+            children: [
+              Expanded(
+                flex: 4,
+                child: FilledButton(
+                  onPressed: () => Navigator.pop(context, 'settings'),
+                  style: FilledButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    minimumSize: const Size(0, 42),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                  child: const FittedBox(
+                    fit: BoxFit.scaleDown,
+                    child: Text('Open Settings'),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 4),
+              Expanded(
+                flex: 3,
+                child: TextButton(
+                  onPressed: () => Navigator.pop(context, 'appinfo'),
+                  child: const Text('App info'),
+                ),
+              ),
+              const SizedBox(width: 4),
+              Expanded(
+                flex: 3,
+                child: TextButton(
+                  onPressed: () => Navigator.pop(context, 'cancel'),
+                  child: const Text('Cancel'),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+
+    if (choice == 'settings' || choice == 'appinfo') {
+      _waitingForAccessibility = choice == 'settings';
+
+      try {
+        if (choice == 'settings') {
+          await accessibility.openSettings();
+        } else {
+          await accessibility.openAppInfo();
+        }
+      } catch (e) {
+        _waitingForAccessibility = false;
+        if (mounted) {
+          setState(() {
+            wakeStatus = 'Could not open settings: $e';
+          });
+        }
+      }
+    }
+
+    return false;
   }
 
   Future<void> _loadApps() async {
@@ -674,6 +773,7 @@ class _SetupScreenState extends State<SetupScreen> {
   // close this screen. The listener is a foreground service, so it keeps
   // working after this screen closes or is cleared from Recents.
   Future<void> _getStarted() async {
+    debugPrint('GET STARTED BUTTON CLICKED');
     // Can't start without at least one selected app.
     if (selectedApps.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -715,6 +815,16 @@ class _SetupScreenState extends State<SetupScreen> {
       if (!await Permission.ignoreBatteryOptimizations.isGranted) {
         await Permission.ignoreBatteryOptimizations.request();
       }
+
+      // Stops battery saving from killing the listener in the background.
+      if (!await Permission.ignoreBatteryOptimizations.isGranted) {
+        await Permission.ignoreBatteryOptimizations.request();
+      }
+
+      // NEW: Accessibility must be ON before the assistant starts.
+      if (!await _ensureAccessibility()) return;
+
+      await wakeWord.setAllowedApps(selectedApps);
 
       await wakeWord.setAllowedApps(selectedApps);
       await wakeWord.setLanguage(selectedLanguage);
@@ -771,6 +881,7 @@ class _SetupScreenState extends State<SetupScreen> {
 
   // One button: turns the microphone (wake-word listening) on or off.
   Future<void> _toggleMicrophone() async {
+    debugPrint('MICROPHONE BUTTON CLICKED');
     if (wakeBusy) return;
 
     if (backgroundListening) {
@@ -907,6 +1018,7 @@ class _SetupScreenState extends State<SetupScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     unawaited(_loadApps());
     unawaited(_syncListeningState());
 
@@ -972,11 +1084,11 @@ class _SetupScreenState extends State<SetupScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     wakeSubscription?.cancel();
-
+    _searchController.dispose();
     voice.dispose();
     super.dispose();
-    _searchController.dispose();
   }
 
   @override
@@ -1008,7 +1120,6 @@ class _SetupScreenState extends State<SetupScreen> {
                           color: Colors.white,
                         ),
                       ),
-                      const SizedBox(height: 12),
                       Text(
                         'Voice Assistant',
                         style: TextStyle(
@@ -1017,7 +1128,6 @@ class _SetupScreenState extends State<SetupScreen> {
                           color: colors.primary,
                         ),
                       ),
-                      const SizedBox(height: 4),
                       Text(
                         'Your phone, your voice, your assistant.',
                         style: TextStyle(
@@ -1030,7 +1140,7 @@ class _SetupScreenState extends State<SetupScreen> {
                   ),
                 ),
 
-                const SizedBox(height: 24),
+                const SizedBox(height: 14),
 
                 const Text(
                   'Choose your language',
@@ -1142,64 +1252,67 @@ class _SetupScreenState extends State<SetupScreen> {
 
                 const SizedBox(height: 10),
 
-                Container(
-                  height: 300,
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(16),
-                  ),
-                  child: appsLoading
-                      ? const Center(child: CircularProgressIndicator())
-                      : _visibleApps.isEmpty
-                      ? Center(
-                          child: Text(
-                            installedApps.isEmpty
-                                ? 'No apps found.'
-                                : 'No app matches "$appSearch".',
-                            style: TextStyle(color: Colors.grey.shade600),
-                          ),
-                        )
-                      : ListView.separated(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 22,
-                            vertical: 5,
-                          ),
-                          itemCount: _visibleApps.length,
-                          separatorBuilder: (_, _) =>
-                              Divider(height: 1, color: Colors.grey.shade200),
-                          itemBuilder: (context, index) {
-                            final app = _visibleApps[index];
-                            final isSelected = selectedApps.contains(
-                              app.packageName,
-                            );
+                Material(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(16),
+                  child: SizedBox(
+                    height: 280,
+                    child: appsLoading
+                        ? const Center(child: CircularProgressIndicator())
+                        : _visibleApps.isEmpty
+                        ? Center(
+                            child: Text(
+                              installedApps.isEmpty
+                                  ? 'No apps found.'
+                                  : 'No app matches "$appSearch".',
+                              style: TextStyle(color: Colors.grey.shade600),
+                            ),
+                          )
+                        : ListView.separated(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 22,
+                              vertical: 5,
+                            ),
+                            itemCount: _visibleApps.length,
+                            separatorBuilder: (_, _) =>
+                                Divider(height: 1, color: Colors.grey.shade200),
+                            itemBuilder: (context, index) {
+                              final app = _visibleApps[index];
+                              final isSelected = selectedApps.contains(
+                                app.packageName,
+                              );
 
-                            return CheckboxListTile(
-                              contentPadding: EdgeInsets.zero,
-                              controlAffinity: ListTileControlAffinity.trailing,
-                              secondary: _appIcon(app, colors),
-                              title: Text(
-                                app.name,
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.w500,
+                              return CheckboxListTile(
+                                contentPadding: EdgeInsets.zero,
+                                controlAffinity:
+                                    ListTileControlAffinity.trailing,
+                                secondary: _appIcon(app, colors),
+                                title: Text(
+                                  app.name,
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w500,
+                                  ),
                                 ),
-                              ),
-                              value: isSelected,
-                              activeColor: colors.primary,
-                              onChanged: (checked) {
-                                setState(() {
-                                  if (checked == true) {
-                                    selectedApps.add(app.packageName);
-                                  } else {
-                                    selectedApps.remove(app.packageName);
-                                  }
-                                });
+                                value: isSelected,
+                                activeColor: colors.primary,
+                                onChanged: (checked) {
+                                  setState(() {
+                                    if (checked == true) {
+                                      selectedApps.add(app.packageName);
+                                    } else {
+                                      selectedApps.remove(app.packageName);
+                                    }
+                                  });
 
-                                _saveSelection();
-                              },
-                            );
-                          },
-                        ),
+                                  _saveSelection();
+                                },
+                              );
+                            },
+                          ),
+                  ),
                 ),
+
+                const SizedBox(height: 15),
 
                 Card(
                   child: Padding(
@@ -1243,14 +1356,14 @@ class _SetupScreenState extends State<SetupScreen> {
                           ),
                         ],
 
-                        const SizedBox(height: 14),
+                        const SizedBox(height: 8),
                         SizedBox(
                           width: double.infinity,
                           child: FilledButton.icon(
                             style: FilledButton.styleFrom(
                               backgroundColor: backgroundListening
-                                  ? Colors.red.shade700
-                                  : null,
+                                  ? const Color(0xFFC62828) // Deep red
+                                  : const Color(0xFF2E7D32), // Emerald green
                               foregroundColor: backgroundListening
                                   ? Colors.white
                                   : null,
@@ -1271,8 +1384,6 @@ class _SetupScreenState extends State<SetupScreen> {
                   ),
                 ),
 
-                const SizedBox(height: 8),
-
                 CheckboxListTile(
                   contentPadding: EdgeInsets.zero,
                   controlAffinity: ListTileControlAffinity.leading,
@@ -1289,8 +1400,6 @@ class _SetupScreenState extends State<SetupScreen> {
                   },
                 ),
 
-                const SizedBox(height: 8),
-
                 SizedBox(
                   width: double.infinity,
                   height: 54,
@@ -1304,6 +1413,22 @@ class _SetupScreenState extends State<SetupScreen> {
                         fontWeight: FontWeight.bold,
                       ),
                     ),
+                  ),
+                ),
+
+                const SizedBox(height: 10),
+
+                SizedBox(
+                  width: double.infinity,
+                  height: 48,
+                  child: OutlinedButton.icon(
+                    onPressed: () {
+                      Navigator.of(context).push(
+                        MaterialPageRoute(builder: (_) => const GuideScreen()),
+                      );
+                    },
+                    icon: const Icon(Icons.help_outline),
+                    label: const Text('Help / Guide'),
                   ),
                 ),
 
@@ -1322,5 +1447,5 @@ class _InstalledApp {
   final String packageName;
   final Uint8List? icon;
 
-  const _InstalledApp(this.name, this.packageName, [this.icon]);
+  const _InstalledApp(this.name, this.packageName) : icon = null;
 }

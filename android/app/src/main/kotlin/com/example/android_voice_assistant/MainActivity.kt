@@ -14,6 +14,9 @@ import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
+import android.content.ComponentName
+import android.net.Uri
+import android.provider.Settings
 
 class MainActivity : FlutterActivity() {
 
@@ -32,6 +35,19 @@ class MainActivity : FlutterActivity() {
 
         return out.toByteArray()
     }
+    private fun isAccessibilityServiceEnabled(): Boolean {
+    val expected = ComponentName(
+        this,
+        VoiceAccessibilityService::class.java
+    ).flattenToString()
+
+    val enabledServices = Settings.Secure.getString(
+        contentResolver,
+        Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+    ) ?: return false
+
+    return enabledServices.split(':').any { it.equals(expected, ignoreCase = true) }
+}
 
     override fun onDestroy() {
         iconExecutor.shutdown()
@@ -204,5 +220,39 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+        MethodChannel(
+    flutterEngine.dartExecutor.binaryMessenger,
+    "hello_boss/accessibility"
+).setMethodCallHandler { call, result ->
+    when (call.method) {
+        "isEnabled" -> result.success(isAccessibilityServiceEnabled())
+
+        "openSettings" -> {
+            try {
+                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                result.success(true)
+            } catch (e: Exception) {
+                result.error("OPEN_FAILED", e.message, null)
+            }
+        }
+
+        // Android 13+: App info > ⋮ > "Allow restricted settings"
+        "openAppInfo" -> {
+            try {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:$packageName")
+                    )
+                )
+                result.success(true)
+            } catch (e: Exception) {
+                result.error("OPEN_FAILED", e.message, null)
+            }
+        }
+
+        else -> result.notImplemented()
+    }
+}
     }
 }
