@@ -18,7 +18,7 @@
         <!-- Lets Hello Boss keep listening when the phone's battery saver is on. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
-
+<uses-permission android:name="android.permission.WRITE_SETTINGS" />
     <application
         android:name="${applicationName}"
         android:label="android_voice_assistant"
@@ -78,6 +78,8 @@
 
     <!-- App visibility and speech recognition queries -->
     <queries>
+    <package android:name="com.google.android.gms" />
+<package android:name="com.samsung.android.app.sharelive" />
 
         <!-- Text-processing plugin -->
         <intent>

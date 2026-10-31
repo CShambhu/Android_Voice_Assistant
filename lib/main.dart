@@ -1,6 +1,8 @@
 import 'dart:async';
 
+import 'package:android_voice_assistant/choose_controls.dart';
 import 'package:android_voice_assistant/services/wake_word_bridge.dart';
+import 'package:android_voice_assistant/widget/choose_apps.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:installed_apps/installed_apps.dart';
@@ -10,6 +12,7 @@ import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:android_voice_assistant/screens/guide_screens.dart';
 import 'package:android_voice_assistant/services/accessibility_bridge.dart';
+import 'package:android_voice_assistant/services/device_control_bridge.dart';
 
 void main() {
   runApp(const HelloBossApp());
@@ -27,6 +30,9 @@ class VoiceController extends ChangeNotifier {
   // Cache installed apps for faster subsequent launches.
   List<dynamic>? _installedAppsCache;
 
+  List<ControlFeature> controlFeatures = [];
+  final Set<String> selectedFeatures = {};
+  bool featuresLoading = true;
   // Queue commands instead of dropping commands received close together.
   Future<void> _commandQueue = Future<void>.value();
 
@@ -483,6 +489,16 @@ class _SetupScreenState extends State<SetupScreen> with WidgetsBindingObserver {
   final WakeWordBridge wakeWord = WakeWordBridge();
   final AccessibilityBridge accessibility = AccessibilityBridge();
   bool _waitingForAccessibility = false;
+  final DeviceControlBridge deviceControl = DeviceControlBridge();
+  final TextEditingController _testController = TextEditingController();
+
+  List<ControlFeature> controlFeatures = [];
+  final Set<String> selectedFeatures = {};
+  bool featuresLoading = true;
+
+  bool writeSettingsOk = false;
+  bool dndOk = false;
+  String testResult = '';
 
   StreamSubscription<Map<String, dynamic>>? wakeSubscription;
 
@@ -515,8 +531,13 @@ class _SetupScreenState extends State<SetupScreen> with WidgetsBindingObserver {
 
   // Continue setup automatically when the user returns from Settings.
   @override
+  @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed && _waitingForAccessibility) {
+    if (state != AppLifecycleState.resumed) return;
+
+    unawaited(_refreshDevicePermissions());
+
+    if (_waitingForAccessibility) {
       _waitingForAccessibility = false;
 
       accessibility.isEnabled().then((enabled) {
@@ -524,6 +545,96 @@ class _SetupScreenState extends State<SetupScreen> with WidgetsBindingObserver {
           unawaited(_getStarted());
         }
       });
+    }
+  }
+
+  Future<void> _refreshDevicePermissions() async {
+    try {
+      final w = await deviceControl.hasWriteSettings();
+      final d = await deviceControl.hasDndAccess();
+      if (!mounted) return;
+      setState(() {
+        writeSettingsOk = w;
+        dndOk = d;
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _loadFeatures() async {
+    try {
+      final available = await deviceControl.getFeatures();
+      final saved = await deviceControl.getAllowedFeatures();
+      final ids = available.map((f) => f.id).toSet();
+
+      if (!mounted) return;
+
+      setState(() {
+        controlFeatures = available;
+        selectedFeatures
+          ..clear()
+          ..addAll(saved.where(ids.contains));
+        featuresLoading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        featuresLoading = false;
+        wakeStatus = 'Could not check phone controls: $e';
+      });
+    }
+  }
+
+  void _saveFeatureSelection() {
+    unawaited(
+      deviceControl.setAllowedFeatures(selectedFeatures).catchError((Object e) {
+        if (!mounted) return;
+        setState(() {
+          wakeStatus = 'Could not save phone controls: $e';
+        });
+      }),
+    );
+  }
+
+  IconData _featureIcon(String id) {
+    switch (id) {
+      case 'FLASHLIGHT':
+        return Icons.flashlight_on;
+      case 'SCREENSHOT':
+        return Icons.screenshot;
+      case 'WIFI':
+        return Icons.wifi;
+      case 'BLUETOOTH':
+        return Icons.bluetooth;
+      case 'LOCATION':
+        return Icons.location_on;
+      case 'AUTO_ROTATE':
+        return Icons.screen_rotation;
+      case 'AIRPLANE':
+        return Icons.airplanemode_active;
+      case 'HOTSPOT':
+        return Icons.wifi_tethering;
+      case 'MOBILE_DATA':
+        return Icons.signal_cellular_alt;
+      case 'QR_SCANNER':
+        return Icons.qr_code_scanner;
+      case 'BATTERY_SAVER':
+        return Icons.battery_saver;
+      case 'DND':
+        return Icons.do_not_disturb_on;
+      case 'SCREEN_RECORD':
+        return Icons.videocam;
+      case 'NFC':
+        return Icons.nfc;
+      case 'DARK_MODE':
+        return Icons.dark_mode;
+      case 'CAST':
+        return Icons.cast;
+      case 'QUICK_SHARE':
+        return Icons.share;
+      case 'DATA_SAVER':
+        return Icons.data_saver_on;
+      default:
+        return Icons.settings;
     }
   }
 
@@ -812,20 +923,13 @@ class _SetupScreenState extends State<SetupScreen> with WidgetsBindingObserver {
       }
 
       // Stops battery saving from killing the listener in the background.
-      if (!await Permission.ignoreBatteryOptimizations.isGranted) {
-        await Permission.ignoreBatteryOptimizations.request();
-      }
-
-      // Stops battery saving from killing the listener in the background.
-      if (!await Permission.ignoreBatteryOptimizations.isGranted) {
-        await Permission.ignoreBatteryOptimizations.request();
-      }
+      // if (!await Permission.ignoreBatteryOptimizations.isGranted) {
+      //   await Permission.ignoreBatteryOptimizations.request();
+      // }
 
       // NEW: Accessibility must be ON before the assistant starts.
       if (!await _ensureAccessibility()) return;
-
-      await wakeWord.setAllowedApps(selectedApps);
-
+      await deviceControl.setAllowedFeatures(selectedFeatures);
       await wakeWord.setAllowedApps(selectedApps);
       await wakeWord.setLanguage(selectedLanguage);
       await wakeWord.start();
@@ -1021,6 +1125,8 @@ class _SetupScreenState extends State<SetupScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     unawaited(_loadApps());
     unawaited(_syncListeningState());
+    unawaited(_loadFeatures());
+    unawaited(_refreshDevicePermissions());
 
     wakeSubscription = wakeWord.events.listen(
       (event) {
@@ -1088,6 +1194,7 @@ class _SetupScreenState extends State<SetupScreen> with WidgetsBindingObserver {
     wakeSubscription?.cancel();
     _searchController.dispose();
     voice.dispose();
+    _testController.dispose();
     super.dispose();
   }
 
@@ -1140,7 +1247,7 @@ class _SetupScreenState extends State<SetupScreen> with WidgetsBindingObserver {
                   ),
                 ),
 
-                const SizedBox(height: 14),
+                const SizedBox(height: 8),
 
                 const Text(
                   'Choose your language',
@@ -1182,137 +1289,178 @@ class _SetupScreenState extends State<SetupScreen> with WidgetsBindingObserver {
                   },
                 ),
 
-                const SizedBox(height: 20),
-
-                Row(
-                  children: [
-                    const Expanded(
-                      child: Text(
-                        'Choose your apps',
-                        style: TextStyle(
-                          fontSize: 17,
-                          fontWeight: FontWeight.w600,
+                const SizedBox(height: 12),
+                // Choose your apps button
+                SizedBox(
+                  width: double.infinity,
+                  height: 54,
+                  child: OutlinedButton(
+                    onPressed: () {
+                      Navigator.of(context).push(
+                        MaterialPageRoute(
+                          builder: (context) => ChooseApps(
+                            colors: colors,
+                            selectedApps: selectedApps,
+                            visibleApps: _visibleApps,
+                            installedApps: installedApps,
+                            appsLoading: appsLoading,
+                            appSearch: appSearch,
+                            searchController: _searchController,
+                            onSearchChanged: (value) {
+                              setState(() {
+                                appSearch = value;
+                              });
+                            },
+                            onAppSelectionChanged: (packageName, checked) {
+                              setState(() {
+                                if (checked) {
+                                  selectedApps.add(packageName);
+                                } else {
+                                  selectedApps.remove(packageName);
+                                }
+                              });
+                            },
+                            appIcon: (app, colors, {double size = 42}) {
+                              return _appIcon(
+                                app as _InstalledApp,
+                                colors,
+                                size: size,
+                              );
+                            },
+                            onSaveSelection: _saveSelection,
+                          ),
                         ),
+                      );
+                    },
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: colors.primary,
+                      side: BorderSide(
+                        color: colors.primary.withAlpha(100),
+                        width: 1.3,
                       ),
-                    ),
-                    Text(
-                      '${selectedApps.length} selected',
-                      style: TextStyle(
-                        color: colors.primary,
-                        fontWeight: FontWeight.w600,
+                      backgroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16),
                       ),
+                      padding: const EdgeInsets.symmetric(horizontal: 18),
                     ),
-                  ],
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.apps_rounded,
+                          size: 23,
+                          color: colors.primary,
+                        ),
+                        const SizedBox(width: 14),
+                        const Expanded(
+                          child: Text(
+                            'Choose your apps',
+                            style: TextStyle(
+                              fontSize: 15,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                        Icon(
+                          Icons.arrow_forward_ios_rounded,
+                          size: 15,
+                          color: colors.primary.withAlpha(160),
+                        ),
+                      ],
+                    ),
+                  ),
                 ),
-
-                const SizedBox(height: 4),
-                Text(
-                  'Voice Assistant will only open and control the apps you tick here.',
-                  style: TextStyle(fontSize: 13, color: Colors.grey.shade700),
-                ),
-
-                const SizedBox(height: 10),
-
-                _selectedAppsStrip(colors),
 
                 const SizedBox(height: 12),
 
-                TextField(
-                  controller: _searchController,
-                  decoration: InputDecoration(
-                    hintText: 'Search apps',
-                    prefixIcon: const Icon(Icons.search),
-                    suffixIcon: appSearch.isEmpty
-                        ? null
-                        : IconButton(
-                            tooltip: 'Clear',
-                            icon: const Icon(Icons.close),
-                            onPressed: () {
-                              _searchController.clear();
-                              FocusScope.of(context).unfocus();
+                // Choose your controls button
+                SizedBox(
+                  width: double.infinity,
+                  height: 54,
+                  child: OutlinedButton(
+                    onPressed: () {
+                      Navigator.of(context).push(
+                        MaterialPageRoute(
+                          builder: (context) => ChooseControls(
+                            colors: colors,
+                            selectedFeatures: selectedFeatures,
+                            controlFeatures: controlFeatures,
+                            featuresLoading: featuresLoading,
+                            writeSettingsOk: writeSettingsOk,
+                            dndOk: dndOk,
+                            testResult: testResult,
+                            featureIcon: _featureIcon,
+                            onSaveFeatureSelection: _saveFeatureSelection,
+                            onOpenWriteSettings: () {
+                              deviceControl.openWriteSettings();
+                            },
+                            onOpenDndAccess: () {
+                              deviceControl.openDndAccess();
+                            },
+                            onFeatureSelectionChanged: (id) {
                               setState(() {
-                                appSearch = '';
+                                if (selectedFeatures.contains(id)) {
+                                  selectedFeatures.remove(id);
+                                } else {
+                                  selectedFeatures.add(id);
+                                }
+                              });
+                            },
+                            onSelectAll: () {
+                              setState(() {
+                                selectedFeatures
+                                  ..clear()
+                                  ..addAll(controlFeatures.map((f) => f.id));
+                              });
+                            },
+                            onClearAll: () {
+                              setState(() {
+                                selectedFeatures.clear();
                               });
                             },
                           ),
-                    filled: true,
-                    fillColor: Colors.white,
-                    contentPadding: const EdgeInsets.symmetric(vertical: 0),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(16),
-                      borderSide: BorderSide.none,
+                        ),
+                      );
+                    },
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: colors.primary,
+                      side: BorderSide(
+                        color: colors.primary.withAlpha(100),
+                        width: 1.3,
+                      ),
+                      backgroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      padding: const EdgeInsets.symmetric(horizontal: 18),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.tune_rounded,
+                          size: 23,
+                          color: colors.primary,
+                        ),
+                        const SizedBox(width: 14),
+                        const Expanded(
+                          child: Text(
+                            'Choose your controls',
+                            style: TextStyle(
+                              fontSize: 15,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                        Icon(
+                          Icons.arrow_forward_ios_rounded,
+                          size: 15,
+                          color: colors.primary.withAlpha(160),
+                        ),
+                      ],
                     ),
                   ),
-                  onChanged: (value) {
-                    setState(() {
-                      appSearch = value;
-                    });
-                  },
                 ),
-
-                const SizedBox(height: 10),
-
-                Material(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(16),
-                  child: SizedBox(
-                    height: 280,
-                    child: appsLoading
-                        ? const Center(child: CircularProgressIndicator())
-                        : _visibleApps.isEmpty
-                        ? Center(
-                            child: Text(
-                              installedApps.isEmpty
-                                  ? 'No apps found.'
-                                  : 'No app matches "$appSearch".',
-                              style: TextStyle(color: Colors.grey.shade600),
-                            ),
-                          )
-                        : ListView.separated(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 22,
-                              vertical: 5,
-                            ),
-                            itemCount: _visibleApps.length,
-                            separatorBuilder: (_, _) =>
-                                Divider(height: 1, color: Colors.grey.shade200),
-                            itemBuilder: (context, index) {
-                              final app = _visibleApps[index];
-                              final isSelected = selectedApps.contains(
-                                app.packageName,
-                              );
-
-                              return CheckboxListTile(
-                                contentPadding: EdgeInsets.zero,
-                                controlAffinity:
-                                    ListTileControlAffinity.trailing,
-                                secondary: _appIcon(app, colors),
-                                title: Text(
-                                  app.name,
-                                  style: const TextStyle(
-                                    fontWeight: FontWeight.w500,
-                                  ),
-                                ),
-                                value: isSelected,
-                                activeColor: colors.primary,
-                                onChanged: (checked) {
-                                  setState(() {
-                                    if (checked == true) {
-                                      selectedApps.add(app.packageName);
-                                    } else {
-                                      selectedApps.remove(app.packageName);
-                                    }
-                                  });
-
-                                  _saveSelection();
-                                },
-                              );
-                            },
-                          ),
-                  ),
-                ),
-
-                const SizedBox(height: 15),
+                const SizedBox(height: 8),
 
                 Card(
                   child: Padding(
@@ -1322,7 +1470,7 @@ class _SetupScreenState extends State<SetupScreen> with WidgetsBindingObserver {
                       children: [
                         const Row(
                           children: [
-                            Icon(Icons.hearing),
+                            // Icon(Icons.hearing),
                             SizedBox(width: 8),
                             Expanded(
                               child: Text(
@@ -1405,7 +1553,7 @@ class _SetupScreenState extends State<SetupScreen> with WidgetsBindingObserver {
                   height: 54,
                   child: FilledButton.icon(
                     onPressed: wakeBusy ? null : _getStarted,
-                    icon: const Icon(Icons.arrow_forward),
+                    icon: const Icon(Icons.arrow_forward, size: 22),
                     label: const Text(
                       'Get Started',
                       style: TextStyle(
@@ -1427,7 +1575,7 @@ class _SetupScreenState extends State<SetupScreen> with WidgetsBindingObserver {
                         MaterialPageRoute(builder: (_) => const GuideScreen()),
                       );
                     },
-                    icon: const Icon(Icons.help_outline),
+                    icon: const Icon(Icons.help_outline, size: 22),
                     label: const Text('Help / Guide'),
                   ),
                 ),

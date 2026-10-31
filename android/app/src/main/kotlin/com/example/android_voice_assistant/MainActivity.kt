@@ -17,6 +17,7 @@ import java.util.concurrent.Executors
 import android.content.ComponentName
 import android.net.Uri
 import android.provider.Settings
+import android.app.NotificationManager
 
 class MainActivity : FlutterActivity() {
 
@@ -254,5 +255,74 @@ class MainActivity : FlutterActivity() {
         else -> result.notImplemented()
     }
 }
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "hello_boss/device_control"
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+
+                // Runs a command like "turn on flashlight" (used by the test box).
+                "execute" -> {
+                    val command = call.argument<String>("command") ?: ""
+                    var replied = false
+
+                    // Make sure Flutter gets exactly one reply.
+                    fun reply(message: String) {
+                        if (replied) return
+                        replied = true
+                        result.success(message)
+                    }
+
+                    try {
+                        val handled = ControlCommandParser.handle(
+                            applicationContext,
+                            command
+                        ) { msg -> reply(msg) }
+
+                        if (!handled) reply("Not a device command")
+                    } catch (e: Exception) {
+                        reply("Could not run the command: ${e.message}")
+                    }
+                }
+
+                // Only the controls this phone supports.
+                "getFeatures" -> result.success(DeviceFeatures.list(this))
+
+                // The ones the user ticked.
+                "getAllowedFeatures" ->
+                    result.success(DeviceFeatures.loadAllowed(this).map { it.name })
+
+                "setAllowedFeatures" -> {
+                    val ids = call.argument<List<String>>("ids") ?: emptyList()
+                    DeviceFeatures.saveAllowed(this, ids.toSet())
+                    result.success(null)
+                }
+
+                // Optional permissions
+                "hasWriteSettings" -> result.success(Settings.System.canWrite(this))
+
+                "openWriteSettings" -> {
+                    startActivity(
+                        Intent(
+                            Settings.ACTION_MANAGE_WRITE_SETTINGS,
+                            Uri.parse("package:$packageName")
+                        )
+                    )
+                    result.success(true)
+                }
+
+                "hasDndAccess" -> result.success(
+                    getSystemService(NotificationManager::class.java)
+                        .isNotificationPolicyAccessGranted
+                )
+
+                "openDndAccess" -> {
+                    startActivity(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS))
+                    result.success(true)
+                }
+
+                else -> result.notImplemented()
+            }
+        }
     }
 }

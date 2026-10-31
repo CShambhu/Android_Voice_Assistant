@@ -444,6 +444,12 @@ override fun onError(error: Int) {
     private fun handleCommand(spoken: String) {
         val command = spoken.trim().trimEnd('.', '!', '?')
         val normalizedCommand = normalize(command)
+        // Phone controls (Wi-Fi, flashlight, screenshot, ...). Checked first so that
+// "start screen recording" isn't treated as "open an app called ...".
+val handledAsControl = ControlCommandParser.handle(applicationContext, spoken) { message ->
+    report("status", message)
+}
+if (handledAsControl) return
 
         // Stop the Hello Boss listening service.
         if (
