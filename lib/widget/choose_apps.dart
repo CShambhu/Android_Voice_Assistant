@@ -3,14 +3,15 @@ import 'package:flutter/material.dart';
 class ChooseApps extends StatefulWidget {
   final ColorScheme colors;
   final Set<String> selectedApps;
-  final List<dynamic> visibleApps;
   final List<dynamic> installedApps;
   final bool appsLoading;
-  final String appSearch;
   final TextEditingController searchController;
 
   final Function(String) onSearchChanged;
   final Function(String, bool) onAppSelectionChanged;
+
+  /// Select or unselect many apps at once (one parent rebuild, not one per app).
+  final void Function(Set<String>, bool) onBulkSelectionChanged;
 
   final Widget Function(dynamic, ColorScheme, {double size}) appIcon;
 
@@ -20,13 +21,12 @@ class ChooseApps extends StatefulWidget {
     super.key,
     required this.colors,
     required this.selectedApps,
-    required this.visibleApps,
     required this.installedApps,
     required this.appsLoading,
-    required this.appSearch,
     required this.searchController,
     required this.onSearchChanged,
     required this.onAppSelectionChanged,
+    required this.onBulkSelectionChanged,
     required this.appIcon,
     required this.onSaveSelection,
   });
@@ -38,10 +38,32 @@ class ChooseApps extends StatefulWidget {
 class _ChooseAppsState extends State<ChooseApps> {
   late Set<String> _selectedApps;
 
+  // The search text lives HERE. Before, the filtered list was handed in once
+  // when this page opened, so typing never changed what was shown.
+  late String _query;
+
+  List<dynamic> get _visibleApps {
+    final query = _query.trim().toLowerCase();
+    if (query.isEmpty) return widget.installedApps;
+
+    return widget.installedApps
+        .where((app) => (app.name as String).toLowerCase().contains(query))
+        .toList();
+  }
+
+  void _searchChanged(String value) {
+    setState(() {
+      _query = value;
+    });
+
+    widget.onSearchChanged(value);
+  }
+
   @override
   void initState() {
     super.initState();
     _selectedApps = {...widget.selectedApps};
+    _query = widget.searchController.text;
   }
 
   @override
@@ -67,6 +89,24 @@ class _ChooseAppsState extends State<ChooseApps> {
     widget.onSaveSelection();
   }
 
+  // Select every app in the list. While a search is typed, this selects
+  // just the apps that match it (all apps when the search box is empty).
+  void _selectAll() {
+    final packages = _visibleApps
+        .map<String>((app) => app.packageName as String)
+        .where((pkg) => !_selectedApps.contains(pkg))
+        .toSet();
+
+    if (packages.isEmpty) return;
+
+    setState(() {
+      _selectedApps.addAll(packages);
+    });
+
+    widget.onBulkSelectionChanged(packages, true);
+    widget.onSaveSelection();
+  }
+
   // Clear all selected apps.
   void _clearAll() {
     if (_selectedApps.isEmpty) return;
@@ -77,12 +117,13 @@ class _ChooseAppsState extends State<ChooseApps> {
       _selectedApps.clear();
     });
 
-    for (final packageName in packages) {
-      widget.onAppSelectionChanged(packageName, false);
-    }
-
+    widget.onBulkSelectionChanged(packages, false);
     widget.onSaveSelection();
   }
+
+  bool get _allVisibleSelected =>
+      _visibleApps.isNotEmpty &&
+      _visibleApps.every((app) => _selectedApps.contains(app.packageName));
 
   // Selected apps section.
   Widget _buildSelectedApps() {
@@ -193,7 +234,7 @@ class _ChooseAppsState extends State<ChooseApps> {
         hintText: 'Search apps',
         prefixIcon: const Icon(Icons.search),
 
-        suffixIcon: widget.appSearch.isEmpty
+        suffixIcon: _query.isEmpty
             ? null
             : IconButton(
                 tooltip: 'Clear',
@@ -203,9 +244,7 @@ class _ChooseAppsState extends State<ChooseApps> {
 
                   FocusScope.of(context).unfocus();
 
-                  widget.onSearchChanged('');
-
-                  setState(() {});
+                  _searchChanged('');
                 },
               ),
 
@@ -219,7 +258,7 @@ class _ChooseAppsState extends State<ChooseApps> {
           borderSide: BorderSide.none,
         ),
       ),
-      onChanged: widget.onSearchChanged,
+      onChanged: _searchChanged,
     );
   }
 
@@ -229,12 +268,14 @@ class _ChooseAppsState extends State<ChooseApps> {
       return const Center(child: CircularProgressIndicator());
     }
 
-    if (widget.visibleApps.isEmpty) {
+    final apps = _visibleApps;
+
+    if (apps.isEmpty) {
       return Center(
         child: Text(
           widget.installedApps.isEmpty
               ? 'No apps found.'
-              : 'No app matches "${widget.appSearch}".',
+              : 'No app matches "$_query".',
           style: TextStyle(color: Colors.grey.shade600),
         ),
       );
@@ -243,13 +284,13 @@ class _ChooseAppsState extends State<ChooseApps> {
     return ListView.separated(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 5),
 
-      itemCount: widget.visibleApps.length,
+      itemCount: apps.length,
 
       separatorBuilder: (_, _) =>
           Divider(height: 1, color: Colors.grey.shade200),
 
       itemBuilder: (context, index) {
-        final app = widget.visibleApps[index];
+        final app = apps[index];
 
         final isSelected = _selectedApps.contains(app.packageName);
 
@@ -337,6 +378,14 @@ class _ChooseAppsState extends State<ChooseApps> {
                       ),
                     ),
                   ),
+
+                  if (!widget.appsLoading && !_allVisibleSelected)
+                    TextButton(
+                      onPressed: _selectAll,
+                      child: Text(
+                        _query.trim().isEmpty ? 'Select all' : 'Select results',
+                      ),
+                    ),
 
                   if (_selectedApps.isNotEmpty)
                     TextButton(

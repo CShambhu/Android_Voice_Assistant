@@ -520,17 +520,11 @@ class _SetupScreenState extends State<SetupScreen> with WidgetsBindingObserver {
   String appSearch = '';
   final TextEditingController _searchController = TextEditingController();
 
-  List<_InstalledApp> get _visibleApps {
-    final query = appSearch.trim().toLowerCase();
-    if (query.isEmpty) return installedApps;
-
-    return installedApps
-        .where((app) => app.name.toLowerCase().contains(query))
-        .toList();
-  }
+  // Bumped whenever the app list changes so the "Choose your apps" page
+  // (a separate screen) rebuilds with fresh data instead of a stale copy.
+  final ValueNotifier<int> _appsRevision = ValueNotifier<int>(0);
 
   // Continue setup automatically when the user returns from Settings.
-  @override
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state != AppLifecycleState.resumed) return;
@@ -728,15 +722,14 @@ class _SetupScreenState extends State<SetupScreen> with WidgetsBindingObserver {
       final saved = await savedFuture;
       final all = await appsFuture;
 
-      final list =
-          <_InstalledApp>[
-            for (final app in all)
-              if (app['package']!.isNotEmpty &&
-                  app['package'] != 'com.example.android_voice_assistant')
-                _InstalledApp(app['name']!, app['package']!),
-          ]..sort(
-            (a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()),
-          ); // Forget saved apps that have since been uninstalled.
+      final list = <_InstalledApp>[
+        for (final app in all)
+          if (app['package']!.isNotEmpty &&
+              app['package'] != 'com.example.android_voice_assistant')
+            _InstalledApp(app['name']!, app['package']!),
+      ]..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+
+      // Forget saved apps that have since been uninstalled.
       final installed = list.map((app) => app.packageName).toSet();
       final stillInstalled = saved.where(installed.contains).toSet();
 
@@ -750,6 +743,8 @@ class _SetupScreenState extends State<SetupScreen> with WidgetsBindingObserver {
         appsLoading = false;
       });
 
+      _appsRevision.value++;
+
       voice.allowedPackages = {...selectedApps};
     } catch (e) {
       if (!mounted) return;
@@ -758,6 +753,8 @@ class _SetupScreenState extends State<SetupScreen> with WidgetsBindingObserver {
         appsLoading = false;
         wakeStatus = 'Could not load your apps: $e';
       });
+
+      _appsRevision.value++;
     }
   }
 
@@ -808,77 +805,6 @@ class _SetupScreenState extends State<SetupScreen> with WidgetsBindingObserver {
   }
 
   // Horizontal strip of the apps already selected, with a remove button.
-  Widget _selectedAppsStrip(ColorScheme colors) {
-    final chosen = installedApps
-        .where((app) => selectedApps.contains(app.packageName))
-        .toList();
-
-    if (chosen.isEmpty) {
-      return Text(
-        'No apps selected yet.',
-        style: TextStyle(fontSize: 13, color: Colors.grey.shade600),
-      );
-    }
-
-    return SizedBox(
-      height: 92,
-      child: ListView.separated(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.only(top: 8, right: 8),
-        itemCount: chosen.length,
-        separatorBuilder: (_, _) => const SizedBox(width: 14),
-        itemBuilder: (context, index) {
-          final app = chosen[index];
-
-          return SizedBox(
-            width: 62,
-            child: Column(
-              children: [
-                Stack(
-                  clipBehavior: Clip.none,
-                  children: [
-                    _appIcon(app, colors, size: 48),
-                    Positioned(
-                      right: -6,
-                      top: -6,
-                      child: GestureDetector(
-                        onTap: () {
-                          setState(() {
-                            selectedApps.remove(app.packageName);
-                          });
-                          _saveSelection();
-                        },
-                        child: Container(
-                          padding: const EdgeInsets.all(2),
-                          decoration: BoxDecoration(
-                            color: Colors.grey.shade700,
-                            shape: BoxShape.circle,
-                          ),
-                          child: const Icon(
-                            Icons.close,
-                            size: 12,
-                            color: Colors.white,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  app.name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(fontSize: 11),
-                ),
-              ],
-            ),
-          );
-        },
-      ),
-    );
-  }
 
   // "Get Started": set everything up, start the background listener, then
   // close this screen. The listener is a foreground service, so it keeps
@@ -1193,6 +1119,7 @@ class _SetupScreenState extends State<SetupScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     wakeSubscription?.cancel();
     _searchController.dispose();
+    _appsRevision.dispose();
     voice.dispose();
     _testController.dispose();
     super.dispose();
@@ -1298,36 +1225,45 @@ class _SetupScreenState extends State<SetupScreen> with WidgetsBindingObserver {
                     onPressed: () {
                       Navigator.of(context).push(
                         MaterialPageRoute(
-                          builder: (context) => ChooseApps(
-                            colors: colors,
-                            selectedApps: selectedApps,
-                            visibleApps: _visibleApps,
-                            installedApps: installedApps,
-                            appsLoading: appsLoading,
-                            appSearch: appSearch,
-                            searchController: _searchController,
-                            onSearchChanged: (value) {
-                              setState(() {
+                          // Rebuilds when the app list finishes loading.
+                          builder: (context) => ValueListenableBuilder<int>(
+                            valueListenable: _appsRevision,
+                            builder: (context, _, _) => ChooseApps(
+                              colors: colors,
+                              selectedApps: selectedApps,
+                              installedApps: installedApps,
+                              appsLoading: appsLoading,
+                              searchController: _searchController,
+                              onSearchChanged: (value) {
                                 appSearch = value;
-                              });
-                            },
-                            onAppSelectionChanged: (packageName, checked) {
-                              setState(() {
-                                if (checked) {
-                                  selectedApps.add(packageName);
-                                } else {
-                                  selectedApps.remove(packageName);
-                                }
-                              });
-                            },
-                            appIcon: (app, colors, {double size = 42}) {
-                              return _appIcon(
-                                app as _InstalledApp,
-                                colors,
-                                size: size,
-                              );
-                            },
-                            onSaveSelection: _saveSelection,
+                              },
+                              onAppSelectionChanged: (packageName, checked) {
+                                setState(() {
+                                  if (checked) {
+                                    selectedApps.add(packageName);
+                                  } else {
+                                    selectedApps.remove(packageName);
+                                  }
+                                });
+                              },
+                              onBulkSelectionChanged: (packages, checked) {
+                                setState(() {
+                                  if (checked) {
+                                    selectedApps.addAll(packages);
+                                  } else {
+                                    selectedApps.removeAll(packages);
+                                  }
+                                });
+                              },
+                              appIcon: (app, colors, {double size = 42}) {
+                                return _appIcon(
+                                  app as _InstalledApp,
+                                  colors,
+                                  size: size,
+                                );
+                              },
+                              onSaveSelection: _saveSelection,
+                            ),
                           ),
                         ),
                       );
