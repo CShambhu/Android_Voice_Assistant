@@ -391,6 +391,32 @@ class VoiceAccessibilityService : AccessibilityService() {
             tap(node)
     }
 
+    // Pulls the Quick Settings panel down with two swipes from the top edge,
+    // like a finger does. Works on the lock screen, where the global
+    // "open Quick Settings" action can end up on the PIN screen.
+    private fun swipeDownPanel(): Boolean {
+        val m = resources.displayMetrics
+        val x = m.widthPixels / 2f
+
+        val first = gesture(x, 8f, x, m.heightPixels * 0.55f, 250)
+
+        uiHandler.postDelayed({
+            gesture(x, 8f, x, m.heightPixels * 0.75f, 250)
+        }, 700)
+
+        return first
+    }
+
+    // True when the lock screen's PIN / password / pattern entry is showing.
+    private fun pinScreenShown(): Boolean {
+        return findByText {
+            it.contains("enter pin") ||
+                it.contains("pin edit box") ||
+                it.contains("enter your password") ||
+                it.contains("draw your pattern")
+        } != null
+    }
+
     /**
      * Opens Quick Settings, finds the tile, taps it (only if needed), checks
      * that it really changed, then closes the panel.
@@ -402,10 +428,19 @@ class VoiceAccessibilityService : AccessibilityService() {
         dialogLabels: List<String> = emptyList(),
         tapIcon: Boolean = false,
         choices: List<String> = emptyList(),
+        openBySwipe: Boolean = false,
         onResult: (TileResult) -> Unit
     ) {
-        if (!performGlobalAction(GLOBAL_ACTION_QUICK_SETTINGS)) {
-            Log.w(TILE_TAG, "Android refused to open Quick Settings")
+        // On the lock screen, pull the panel down the way a finger does.
+        // Otherwise use Android's own "open Quick Settings" action.
+        val opened = if (openBySwipe) {
+            swipeDownPanel()
+        } else {
+            performGlobalAction(GLOBAL_ACTION_QUICK_SETTINGS)
+        }
+
+        if (!opened) {
+            Log.w(TILE_TAG, "Could not open Quick Settings")
             onResult(TileResult.NOT_FOUND)
             return
         }
@@ -420,6 +455,22 @@ class VoiceAccessibilityService : AccessibilityService() {
 
                 if (tile == null) {
                     attempts++
+
+                    // The lock screen is asking for the PIN: the panel is not
+                    // reachable. Stop early; the caller can ask the user to unlock.
+                    if (openBySwipe && attempts >= 2 && pinScreenShown()) {
+                        Log.i(TILE_TAG, "Lock screen is asking for the PIN")
+                        closePanel()
+                        onResult(TileResult.NOT_FOUND)
+                        return
+                    }
+
+                    // Lock screen: the panel sometimes does not open on the
+                    // first swipe. If it still is not there, pull it down again.
+                    if (openBySwipe && (attempts == 4 || attempts == 9)) {
+                        Log.i(TILE_TAG, "Panel not open yet, pulling it down again")
+                        swipeDownPanel()
+                    }
 
                     // Not on the first page? Look at the next pages.
                     if (attempts == 3 || attempts == 6 || attempts == 9 || attempts == 12) {
@@ -476,6 +527,7 @@ class VoiceAccessibilityService : AccessibilityService() {
 
         uiHandler.postDelayed(poll, 700)
     }
+
 
     // Runs after the tile was tapped: either the tile toggled by itself, or
     // a dialog opened (Samsung / Pixel Wi-Fi) and its switch must be used.
@@ -690,6 +742,101 @@ class VoiceAccessibilityService : AccessibilityService() {
 
             onResult(if (failed) TileResult.FAILED else TileResult.CHANGED)
         }, 1200)
+    }
+
+    // Taps the on/off switch of whatever Settings page is on screen
+    // (used for the Airplane mode page, which needs no Quick Settings tile).
+    fun toggleSwitchOnScreen(
+        labels: List<String>,
+        desired: Boolean?,
+        onResult: (TileResult) -> Unit
+    ) {
+        var attempts = 0
+
+        val finder = object : Runnable {
+            override fun run() {
+                val sw = findPageSwitch(labels)
+
+                if (sw == null) {
+                    attempts++
+
+                    if (attempts < 8) {
+                        uiHandler.postDelayed(this, 500)
+                    } else {
+                        Log.i(TILE_TAG, "No switch found on the page")
+                        onResult(TileResult.NOT_FOUND)
+                    }
+                    return
+                }
+
+                val current = stateOf(sw)
+                Log.i(TILE_TAG, "Page switch state=$current, wanted=$desired")
+
+                if (desired != null && current == desired) {
+                    onResult(TileResult.ALREADY)
+                    return
+                }
+
+                val clicked = clickNode(sw)
+                Log.i(TILE_TAG, "Page switch clicked: $clicked")
+
+                uiHandler.postDelayed({
+                    onResult(if (clicked) TileResult.CHANGED else TileResult.FAILED)
+                }, 800)
+            }
+        }
+
+        uiHandler.postDelayed(finder, 800)
+    }
+
+    // The main switch on a Settings page: prefer one that names the feature,
+    // otherwise the top-most visible switch.
+    private fun findPageSwitch(labels: List<String>): AccessibilityNodeInfo? {
+        val switches = ArrayList<AccessibilityNodeInfo>()
+
+        for (root in systemRoots()) {
+            val queue = ArrayDeque<AccessibilityNodeInfo>()
+            queue.add(root)
+
+            while (queue.isNotEmpty()) {
+                val node = queue.removeFirst()
+                val label = textOf(node).trim()
+
+                val realSwitch = node.isCheckable &&
+                    node.className?.toString() != "android.widget.Button"
+
+                if ((realSwitch || label == "on" || label == "off") &&
+                    node.isVisibleToUser
+                ) {
+                    switches.add(node)
+                }
+
+                for (i in 0 until node.childCount) {
+                    node.getChild(i)?.let { queue.add(it) }
+                }
+            }
+        }
+
+        Log.i(TILE_TAG, "Page switches found: ${switches.size}")
+
+        for (sw in switches) {
+            Log.i(
+                TILE_TAG,
+                "  switch class=${sw.className} text='${textOf(sw).trim()}' " +
+                    "near='${nearbyText(sw).take(80)}' checked=${sw.isChecked}"
+            )
+        }
+
+        switches.firstOrNull { sw ->
+            val t = textOf(sw) + " " + nearbyText(sw)
+            labels.any { t.contains(it) }
+        }?.let { return it }
+
+        return switches.minByOrNull {
+            val r = Rect()
+            it.getBoundsInScreen(r)
+            r.top
+        }
     }
 
     override fun onDestroy() {

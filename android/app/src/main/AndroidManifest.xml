@@ -1,4 +1,3 @@
-
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!-- Permissions -->
@@ -22,6 +21,8 @@
 
 <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
 <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+<uses-permission android:name="android.permission.WAKE_LOCK" />
+<uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
     <application
         android:name="${applicationName}"
         android:label="android_voice_assistant"
@@ -71,6 +72,16 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Unlock prompt: lets the user unlock, then runs the voice command -->
+        <activity
+            android:name=".UnlockActivity"
+            android:exported="false"
+            android:taskAffinity=""
+            android:excludeFromRecents="true"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
         <!-- Flutter embedding -->
         <meta-data

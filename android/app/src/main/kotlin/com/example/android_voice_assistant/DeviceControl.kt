@@ -1,12 +1,19 @@
 package com.example.android_voice_assistant
 
+import android.app.KeyguardManager
 import android.app.NotificationManager
+import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
+import android.database.ContentObserver
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.location.LocationManager
+import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
 
@@ -145,56 +152,356 @@ object DeviceControl {
     ) {
         Log.e(TAG, "EXECUTE: feature=${feature.display}, desired=$desired")
 
-        when (feature) {
+        // Locked phone: wake the screen, pull down Quick Settings from the lock
+        // screen and try the tile. If Android wants the PIN/fingerprint first,
+        // show Android's own unlock prompt and run the command after the USER
+        // unlocks. Hello Boss never sees the PIN.
+        val keyguard = ctx.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
 
-            Feature.FLASHLIGHT -> {
-                report(flashlight(ctx, desired))
-            }
+        if (needsScreen(ctx, feature) && keyguard.isKeyguardLocked) {
+            lockedControl(ctx, feature, desired, report)
+            return
+        }
 
-            Feature.SCREENSHOT -> {
-                val service = VoiceAccessibilityService.instance
+        withScreenOn(ctx, needsScreen(ctx, feature)) {
+            when (feature) {
 
-                if (service == null) {
-                    report("Turn on Accessibility first")
-                } else if (service.captureScreenshot()) {
-                    report("Screenshot taken")
-                } else {
-                    report("Could not take a screenshot")
+                Feature.FLASHLIGHT -> {
+                    report(flashlight(ctx, desired))
                 }
-            }
 
-            // Direct system setting when access is granted (no dialog at all),
-            // Quick Settings tile otherwise.
-            Feature.DND -> {
-                val nm = ctx.getSystemService(NotificationManager::class.java)
+                Feature.SCREENSHOT -> {
+                    val service = VoiceAccessibilityService.instance
 
-                if (nm.isNotificationPolicyAccessGranted) {
-                    try {
-                        report(doNotDisturb(nm, desired))
-                    } catch (e: Exception) {
-                        report("Could not change Do Not Disturb: ${e.message}")
+                    if (service == null) {
+                        report("Turn on Accessibility first")
+                    } else if (service.captureScreenshot()) {
+                        report("Screenshot taken")
+                    } else {
+                        report("Could not take a screenshot")
                     }
-                } else {
+                }
+
+                // Direct system setting when access is granted (no dialog at all),
+                // Quick Settings tile otherwise.
+                Feature.DND -> {
+                    val nm = ctx.getSystemService(NotificationManager::class.java)
+
+                    if (nm.isNotificationPolicyAccessGranted) {
+                        try {
+                            report(doNotDisturb(nm, desired))
+                        } catch (e: Exception) {
+                            report("Could not change Do Not Disturb: ${e.message}")
+                        }
+                    } else {
+                        tile(ctx, feature, desired, report)
+                    }
+                }
+
+                Feature.AUTO_ROTATE -> {
+                    if (Settings.System.canWrite(ctx)) {
+                        try {
+                            report(autoRotate(ctx, desired))
+                        } catch (e: Exception) {
+                            report("Could not change auto-rotate: ${e.message}")
+                        }
+                    } else {
+                        tile(ctx, feature, desired, report)
+                    }
+                }
+
+                // Tile in Quick Settings when possible, Airplane mode settings
+                // page otherwise. See airplaneMode() below.
+                Feature.AIRPLANE -> {
+                    airplaneMode(ctx, desired, report)
+                }
+
+                else -> {
                     tile(ctx, feature, desired, report)
                 }
-            }
-
-            Feature.AUTO_ROTATE -> {
-                if (Settings.System.canWrite(ctx)) {
-                    try {
-                        report(autoRotate(ctx, desired))
-                    } catch (e: Exception) {
-                        report("Could not change auto-rotate: ${e.message}")
-                    }
-                } else {
-                    tile(ctx, feature, desired, report)
-                }
-            }
-
-            else -> {
-                tile(ctx, feature, desired, report)
             }
         }
+    }
+
+    // The REAL on/off state, read from Android itself (not from a tile).
+    // null = this feature can't be read back, so we can't confirm a change.
+    private fun realState(ctx: Context, feature: Feature): Boolean? = try {
+        when (feature) {
+            Feature.WIFI ->
+                (ctx.applicationContext.getSystemService(Context.WIFI_SERVICE)
+                    as WifiManager).isWifiEnabled
+
+            Feature.BLUETOOTH ->
+                (ctx.getSystemService(Context.BLUETOOTH_SERVICE)
+                    as BluetoothManager).adapter?.isEnabled
+
+            Feature.LOCATION ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    (ctx.getSystemService(Context.LOCATION_SERVICE)
+                        as LocationManager).isLocationEnabled
+                } else {
+                    null
+                }
+
+            Feature.AIRPLANE -> isAirplaneOn(ctx)
+
+            else -> null
+        }
+    } catch (e: Exception) {
+        null
+    }
+
+    // Locked phone. Samsung (and most phones) ignore Quick Settings taps
+    // while locked, so the only way that works is: if the setting is already
+    // as requested, say so; otherwise ask the USER to unlock with Android's own
+    // prompt, and run the command right after. Hello Boss never sees the PIN.
+    private fun lockedControl(
+        ctx: Context,
+        feature: Feature,
+        desired: Boolean?,
+        report: (String) -> Unit
+    ) {
+        val before = realState(ctx, feature)
+
+        if (before != null && desired != null && before == desired) {
+            report("${feature.display} is already ${if (desired) "on" else "off"}")
+            return
+        }
+
+        requestUnlock(ctx, feature, desired, report)
+    }
+
+    private fun requestUnlock(
+        ctx: Context,
+        feature: Feature,
+        desired: Boolean?,
+        report: (String) -> Unit
+    ) {
+        val word = when (desired) {
+            true -> "on"
+            false -> "off"
+            null -> "toggled"
+        }
+
+        try {
+            ctx.startActivity(
+                Intent(ctx, UnlockActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    .putExtra(UnlockActivity.EXTRA_FEATURE, feature.name)
+                    .putExtra(UnlockActivity.EXTRA_DESIRED, desired?.toString() ?: "")
+            )
+
+            report("Unlock your phone to turn ${feature.display} $word")
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not show the unlock prompt", e)
+            report("${feature.display} needs the phone unlocked first")
+        }
+    }
+
+    // Quick Settings tiles need a lit screen. Direct APIs (torch, DND with
+    // access, auto-rotate with permission) work with the screen off.
+    private fun needsScreen(ctx: Context, feature: Feature): Boolean =
+        when (feature) {
+            Feature.FLASHLIGHT -> false
+            Feature.DND ->
+                !ctx.getSystemService(NotificationManager::class.java)
+                    .isNotificationPolicyAccessGranted
+            Feature.AUTO_ROTATE -> !Settings.System.canWrite(ctx)
+            else -> true
+        }
+
+    // Wakes the screen if it is off, then runs the action.
+    // This does NOT unlock a PIN/pattern/fingerprint lock.
+    @Suppress("DEPRECATION")
+    private fun withScreenOn(ctx: Context, needed: Boolean, action: () -> Unit) {
+        val pm = ctx.getSystemService(Context.POWER_SERVICE) as PowerManager
+
+        if (!needed || pm.isInteractive) {
+            action()
+            return
+        }
+
+        try {
+            pm.newWakeLock(
+                PowerManager.SCREEN_BRIGHT_WAKE_LOCK or
+                    PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                "HelloBoss:wake"
+            ).acquire(30_000)
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not wake the screen", e)
+        }
+
+        Handler(Looper.getMainLooper()).postDelayed({ action() }, 1500)
+    }
+
+    // ----------------------------------------
+    // AIRPLANE MODE
+    // ----------------------------------------
+    //
+    // Why there is no direct toggle:
+    //  - Writing Settings.Global.AIRPLANE_MODE_ON needs WRITE_SECURE_SETTINGS,
+    //    which only system apps (or an ADB grant) can hold.
+    //  - Even with it, the radios only react through the system's own
+    //    connectivity service (needs NETWORK_AIRPLANE_MODE, a system-only
+    //    permission); the old AIRPLANE_MODE broadcast is protected.
+    //  - A Device Owner can only block the setting
+    //    (UserManager.DISALLOW_AIRPLANE_MODE), not change it.
+    // So: tap the Flight mode tile through Accessibility if the tile exists
+    // (no dialog), else open Android's own Airplane mode page. Either way the
+    // REAL resulting state is what gets reported.
+
+    private fun isAirplaneOn(ctx: Context): Boolean =
+        Settings.Global.getInt(
+            ctx.contentResolver,
+            Settings.Global.AIRPLANE_MODE_ON,
+            0
+        ) == 1
+
+    private fun airplaneMode(
+        ctx: Context,
+        desired: Boolean?,
+        report: (String) -> Unit
+    ) {
+        val now = isAirplaneOn(ctx)
+        val target = desired ?: !now
+        val word = if (target) "on" else "off"
+
+        if (now == target) {
+            report("Airplane mode is already $word")
+            return
+        }
+
+        val tileService = VoiceAccessibilityService.instance
+
+        // Best way, no page at all: tap the Flight mode tile in Quick Settings.
+        if (tileService != null) {
+            tileService.toggleQuickSettingTile(
+                labels = Feature.AIRPLANE.tileLabels,
+                desired = target,
+                dialogLabels = Feature.AIRPLANE.dialogLabels,
+                tapIcon = Feature.AIRPLANE.tapIcon,
+                choices = Feature.AIRPLANE.choices
+            ) { result ->
+                if (result == TileResult.NOT_FOUND) {
+                    airplaneViaPage(ctx, target, report)
+                } else {
+                    Handler(Looper.getMainLooper()).postDelayed({
+                        val actual = isAirplaneOn(ctx)
+                        report(
+                            if (actual == target) "Airplane mode $word"
+                            else "Tried to turn Airplane mode $word, but it is " +
+                                "still ${if (actual) "on" else "off"}."
+                        )
+                    }, 1000)
+                }
+            }
+            return
+        }
+
+        airplaneViaPage(ctx, target, report)
+    }
+
+    // Fallback when there is no Flight mode tile: Airplane mode page.
+    private fun airplaneViaPage(
+        ctx: Context,
+        target: Boolean,
+        report: (String) -> Unit
+    ) {
+        val word = if (target) "on" else "off"
+
+        // Open Android's own Airplane mode page.
+        try {
+            ctx.startActivity(
+                Intent(Settings.ACTION_AIRPLANE_MODE_SETTINGS)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not open Airplane mode settings", e)
+            report("Airplane mode settings could not be opened.")
+            return
+        }
+
+        val service = VoiceAccessibilityService.instance
+
+        if (service == null) {
+            watchAirplaneMode(ctx, target)
+            report(
+                "Turn on Hello Boss in Accessibility for one-step switching. " +
+                    "For now, tap the switch to turn Airplane mode $word."
+            )
+            return
+        }
+
+        // Tap the switch on that page for the user, then leave the page.
+        service.toggleSwitchOnScreen(
+            labels = listOf("airplane", "flight", "aeroplane"),
+            desired = target
+        ) { _ ->
+            Handler(Looper.getMainLooper()).postDelayed({
+                val actual = isAirplaneOn(ctx)
+
+                if (actual == target) {
+                    service.goBack()
+                    report("Airplane mode $word")
+                } else {
+                    watchAirplaneMode(ctx, target)
+                    report(
+                        "I could not tap the switch. Tap it yourself to " +
+                            "turn Airplane mode $word."
+                    )
+                }
+            }, 1200)
+        }
+    }
+
+    // Waits (up to 60 s) for the real setting to change, then says so.
+    private fun watchAirplaneMode(ctx: Context, target: Boolean) {
+        val appCtx = ctx.applicationContext
+        val handler = Handler(Looper.getMainLooper())
+        var done = false
+
+        lateinit var observer: ContentObserver
+
+        fun stop() {
+            if (done) return
+            done = true
+            try {
+                appCtx.contentResolver.unregisterContentObserver(observer)
+            } catch (_: Exception) {
+            }
+        }
+
+        observer = object : ContentObserver(handler) {
+            override fun onChange(selfChange: Boolean) {
+                val on = isAirplaneOn(appCtx)
+
+                if (on == target) {
+                    MainActivity.emitServiceEvent(
+                        "status",
+                        if (on) "Airplane mode is now ON"
+                        else "Airplane mode is now OFF"
+                    )
+                    stop()
+                }
+            }
+        }
+
+        appCtx.contentResolver.registerContentObserver(
+            Settings.Global.getUriFor(Settings.Global.AIRPLANE_MODE_ON),
+            false,
+            observer
+        )
+
+        handler.postDelayed({
+            if (!done) {
+                MainActivity.emitServiceEvent(
+                    "status",
+                    "Airplane mode did not change " +
+                        "(still ${if (isAirplaneOn(appCtx)) "ON" else "OFF"})"
+                )
+                stop()
+            }
+        }, 60_000)
     }
 
     // ----------------------------------------

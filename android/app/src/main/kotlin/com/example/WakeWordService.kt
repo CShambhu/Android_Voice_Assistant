@@ -1,4 +1,3 @@
-
 package com.example.android_voice_assistant
 
 import android.Manifest
@@ -17,6 +16,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.provider.Settings
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
@@ -53,6 +53,31 @@ class WakeWordService : Service() {
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    // Keeps the CPU running while the screen is off, so the wake-word
+    // listener (and its capture thread) isn't put to sleep by Android.
+    private var cpuLock: PowerManager.WakeLock? = null
+
+    private fun holdCpu() {
+        try {
+            if (cpuLock?.isHeld == true) return
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            cpuLock = pm.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "HelloBoss:listening"
+            ).apply { acquire() }
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not hold the CPU awake", e)
+        }
+    }
+
+    private fun releaseCpu() {
+        try {
+            if (cpuLock?.isHeld == true) cpuLock?.release()
+        } catch (_: Exception) {
+        }
+        cpuLock = null
+    }
     private val running = AtomicBoolean(false)
     private val capturing = AtomicBoolean(false)
 
@@ -133,6 +158,7 @@ class WakeWordService : Service() {
             )
 
             isActive = true
+            holdCpu()
             report("status", "listening")
             startWakeCapture()
         } catch (e: Exception) {
@@ -960,7 +986,8 @@ private fun goHome() {
     }
 
     override fun onDestroy() {
-                isActive = false
+        releaseCpu()
+        isActive = false
         running.set(false)
         capturing.set(false)
 
