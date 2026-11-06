@@ -144,112 +144,187 @@ object DeviceControl {
     private var torchOn = false
     private var torchRegistered = false
 
-    fun execute(
-        ctx: Context,
-        feature: Feature,
-        desired: Boolean?,
-        report: (String) -> Unit
-    ) {
-        Log.e(TAG, "EXECUTE: feature=${feature.display}, desired=$desired")
+    
+fun execute(
+    ctx: Context,
+    feature: Feature,
+    desired: Boolean?,
+    report: (String) -> Unit
+) {
+    Log.e(TAG, "EXECUTE: feature=${feature.display}, desired=$desired")
 
-        // Locked phone: wake the screen, pull down Quick Settings from the lock
-        // screen and try the tile. If Android wants the PIN/fingerprint first,
-        // show Android's own unlock prompt and run the command after the USER
-        // unlocks. Hello Boss never sees the PIN.
-        val keyguard = ctx.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+    val keyguard =
+        ctx.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
 
-        if (needsScreen(ctx, feature) && keyguard.isKeyguardLocked) {
-            lockedControl(ctx, feature, desired, report)
-            return
-        }
+    // Handle controls while the phone is locked.
+    if (keyguard.isKeyguardLocked && needsScreen(ctx, feature)) {
 
-        withScreenOn(ctx, needsScreen(ctx, feature)) {
-            when (feature) {
+        when (feature) {
 
-                Feature.FLASHLIGHT -> {
-                    report(flashlight(ctx, desired))
-                }
+            Feature.WIFI -> {
+                lockedControl(ctx, feature, desired, report)
+            }
 
-                Feature.SCREENSHOT -> {
-                    val service = VoiceAccessibilityService.instance
+            Feature.AIRPLANE -> {
+                Log.i(TAG, "Locked-screen Airplane mode control")
 
-                    if (service == null) {
-                        report("Turn on Accessibility first")
-                    } else if (service.captureScreenshot()) {
-                        report("Screenshot taken")
-                    } else {
-                        report("Could not take a screenshot")
-                    }
-                }
-
-                // Direct system setting when access is granted (no dialog at all),
-                // Quick Settings tile otherwise.
-                Feature.DND -> {
-                    val nm = ctx.getSystemService(NotificationManager::class.java)
-
-                    if (nm.isNotificationPolicyAccessGranted) {
-                        try {
-                            report(doNotDisturb(nm, desired))
-                        } catch (e: Exception) {
-                            report("Could not change Do Not Disturb: ${e.message}")
-                        }
-                    } else {
-                        tile(ctx, feature, desired, report)
-                    }
-                }
-
-                Feature.AUTO_ROTATE -> {
-                    if (Settings.System.canWrite(ctx)) {
-                        try {
-                            report(autoRotate(ctx, desired))
-                        } catch (e: Exception) {
-                            report("Could not change auto-rotate: ${e.message}")
-                        }
-                    } else {
-                        tile(ctx, feature, desired, report)
-                    }
-                }
-
-                // Tile in Quick Settings when possible, Airplane mode settings
-                // page otherwise. See airplaneMode() below.
-                Feature.AIRPLANE -> {
+                withScreenOn(ctx, true) {
                     airplaneMode(ctx, desired, report)
                 }
+            }
 
-                else -> {
+            else -> {
+                Log.i(
+                    TAG,
+                    "Attempting locked-screen Quick Settings: ${feature.display}"
+                )
+
+                withScreenOn(ctx, true) {
                     tile(ctx, feature, desired, report)
                 }
             }
         }
+
+        return
     }
 
-    // The REAL on/off state, read from Android itself (not from a tile).
-    // null = this feature can't be read back, so we can't confirm a change.
-    private fun realState(ctx: Context, feature: Feature): Boolean? = try {
+    // Normal operation when the phone is unlocked.
+    withScreenOn(ctx, needsScreen(ctx, feature)) {
+
         when (feature) {
-            Feature.WIFI ->
-                (ctx.applicationContext.getSystemService(Context.WIFI_SERVICE)
-                    as WifiManager).isWifiEnabled
 
-            Feature.BLUETOOTH ->
-                (ctx.getSystemService(Context.BLUETOOTH_SERVICE)
-                    as BluetoothManager).adapter?.isEnabled
+            Feature.FLASHLIGHT -> {
+                report(flashlight(ctx, desired))
+            }
 
-            Feature.LOCATION ->
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    (ctx.getSystemService(Context.LOCATION_SERVICE)
-                        as LocationManager).isLocationEnabled
+            Feature.SCREENSHOT -> {
+                val service = VoiceAccessibilityService.instance
+
+                if (service == null) {
+                    report("Turn on Accessibility first")
+                } else if (service.captureScreenshot()) {
+                    report("Screenshot taken")
                 } else {
-                    null
+                    report("Could not take a screenshot")
                 }
+            }
 
-            Feature.AIRPLANE -> isAirplaneOn(ctx)
+            Feature.LOCATION,
+            Feature.BLUETOOTH -> {
+                tile(ctx, feature, desired, report)
+            }
 
-            else -> null
+            Feature.DND -> {
+                val nm =
+                    ctx.getSystemService(NotificationManager::class.java)
+
+                if (nm.isNotificationPolicyAccessGranted) {
+                    try {
+                        report(doNotDisturb(nm, desired))
+                    } catch (e: Exception) {
+                        report("Could not change Do Not Disturb: ${e.message}")
+                    }
+                } else {
+                    tile(ctx, feature, desired, report)
+                }
+            }
+
+            Feature.AUTO_ROTATE -> {
+                if (Settings.System.canWrite(ctx)) {
+                    try {
+                        report(autoRotate(ctx, desired))
+                    } catch (e: Exception) {
+                        report("Could not change auto-rotate: ${e.message}")
+                    }
+                } else {
+                    tile(ctx, feature, desired, report)
+                }
+            }
+
+            Feature.AIRPLANE -> {
+                airplaneMode(ctx, desired, report)
+            }
+
+            else -> {
+                tile(ctx, feature, desired, report)
+            }
         }
-    } catch (e: Exception) {
-        null
     }
+}
+
+
+    private fun realState(
+    ctx: Context,
+    feature: Feature
+): Boolean? = try {
+
+    when (feature) {
+
+        Feature.WIFI -> {
+            val wifi = ctx.applicationContext
+                .getSystemService(Context.WIFI_SERVICE) as WifiManager
+
+            wifi.isWifiEnabled
+        }
+
+        Feature.BLUETOOTH -> {
+            val manager = ctx.getSystemService(
+                Context.BLUETOOTH_SERVICE
+            ) as BluetoothManager
+
+            manager.adapter?.isEnabled
+        }
+
+        Feature.LOCATION -> {
+            val manager = ctx.getSystemService(
+                Context.LOCATION_SERVICE
+            ) as LocationManager
+
+            manager.isLocationEnabled
+        }
+
+        Feature.AIRPLANE -> {
+            isAirplaneOn(ctx)
+        }
+
+        Feature.AUTO_ROTATE -> {
+            Settings.System.getInt(
+                ctx.contentResolver,
+                Settings.System.ACCELEROMETER_ROTATION,
+                0
+            ) == 1
+        }
+
+        Feature.MOBILE_DATA -> {
+            null
+        }
+
+        else -> null
+    }
+
+} catch (e: Exception) {
+    Log.e(TAG, "Could not read ${feature.display} state", e)
+    null
+}
+
+private fun verifyState(
+    ctx: Context,
+    feature: Feature,
+    target: Boolean
+): Boolean {
+    return when (feature) {
+        Feature.WIFI,
+        Feature.BLUETOOTH,
+        Feature.LOCATION,
+        Feature.AIRPLANE,
+        Feature.AUTO_ROTATE -> realState(ctx, feature) == target
+
+        else -> false
+    }
+}
+
+
+
 
     // Locked phone. Samsung (and most phones) ignore Quick Settings taps
     // while locked, so the only way that works is: if the setting is already
@@ -313,26 +388,44 @@ object DeviceControl {
     // Wakes the screen if it is off, then runs the action.
     // This does NOT unlock a PIN/pattern/fingerprint lock.
     @Suppress("DEPRECATION")
-    private fun withScreenOn(ctx: Context, needed: Boolean, action: () -> Unit) {
-        val pm = ctx.getSystemService(Context.POWER_SERVICE) as PowerManager
+private fun withScreenOn(
+    ctx: Context,
+    needed: Boolean,
+    action: () -> Unit
+) {
+    val pm = ctx.getSystemService(
+        Context.POWER_SERVICE
+    ) as PowerManager
 
-        if (!needed || pm.isInteractive) {
-            action()
-            return
-        }
-
-        try {
-            pm.newWakeLock(
-                PowerManager.SCREEN_BRIGHT_WAKE_LOCK or
-                    PowerManager.ACQUIRE_CAUSES_WAKEUP,
-                "HelloBoss:wake"
-            ).acquire(30_000)
-        } catch (e: Exception) {
-            Log.e(TAG, "Could not wake the screen", e)
-        }
-
-        Handler(Looper.getMainLooper()).postDelayed({ action() }, 1500)
+    if (!needed || pm.isInteractive) {
+        action()
+        return
     }
+
+    try {
+        val wakeLock = pm.newWakeLock(
+            PowerManager.SCREEN_BRIGHT_WAKE_LOCK,
+            "HelloBoss:WakeScreen"
+        )
+
+        wakeLock.acquire(5_000)
+
+        Handler(Looper.getMainLooper()).postDelayed({
+            try {
+                if (wakeLock.isHeld) {
+                    wakeLock.release()
+                }
+            } catch (_: Exception) {
+            }
+
+            action()
+        }, 1000)
+
+    } catch (e: Exception) {
+        Log.e(TAG, "Could not wake screen", e)
+        action()
+    }
+}
 
     // ----------------------------------------
     // AIRPLANE MODE
@@ -637,7 +730,8 @@ object DeviceControl {
             desired = desired,
             dialogLabels = feature.dialogLabels,
             tapIcon = feature.tapIcon,
-            choices = feature.choices
+            choices = feature.choices,
+            openBySwipe = true
         ) { result ->
 
             Log.e(

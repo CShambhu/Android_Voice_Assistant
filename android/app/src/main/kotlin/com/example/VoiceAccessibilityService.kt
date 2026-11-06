@@ -11,6 +11,7 @@ import android.provider.Settings
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import java.util.Locale
 
 enum class TileResult { CHANGED, ALREADY, NOT_FOUND, FAILED }
 
@@ -99,28 +100,36 @@ class VoiceAccessibilityService : AccessibilityService() {
     }
 
     private fun textOf(node: AccessibilityNodeInfo): String {
-        val sb = StringBuilder()
+    val parts = mutableListOf<String>()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            sb.append(node.stateDescription ?: "").append(' ')
-        }
-
-        sb.append(node.text ?: "").append(' ').append(node.contentDescription ?: "")
-        return sb.toString().lowercase()
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        node.stateDescription?.toString()?.let(parts::add)
     }
 
-    // true = ON, false = OFF, null = can't tell
-    private fun stateOf(node: AccessibilityNodeInfo): Boolean? {
-        if (node.isCheckable) return node.isChecked
+    node.text?.toString()?.let(parts::add)
+    node.contentDescription?.toString()?.let(parts::add)
 
-        val s = textOf(node)
+    return parts.joinToString(" ").lowercase(Locale.ROOT)
+}
 
-        return when {
-            Regex("\\boff\\b").containsMatchIn(s) -> false
-            Regex("\\bon\\b").containsMatchIn(s) -> true
-            else -> null
-        }
+
+private fun stateOf(node: AccessibilityNodeInfo): Boolean? {
+
+    // Use Android's actual checked state.
+    if (node.isCheckable) {
+        return node.isChecked
     }
+
+    // Use selected state only when the node is explicitly selected.
+    if (node.isSelected) {
+        return true
+    }
+
+    // Accessibility descriptions are manufacturer-dependent.
+    // Do not guess the state from words such as ON/OFF.
+    return null
+}
+
 
     // Every window we can read, Quick Settings (SystemUI) first.
     // Hello Boss's own screen is skipped so a "Wi-Fi" label in our own
@@ -146,38 +155,57 @@ class VoiceAccessibilityService : AccessibilityService() {
             }
     }
 
-    // Finds a node whose text/description contains a label, then returns its clickable parent.
-    private fun findClickable(labels: List<String>): AccessibilityNodeInfo? {
-        val candidates = ArrayList<AccessibilityNodeInfo>()
+    private fun findClickable(
+    labels: List<String>
+): AccessibilityNodeInfo? {
 
-        for (root in systemRoots()) {
-            val queue = ArrayDeque<AccessibilityNodeInfo>()
-            queue.add(root)
+    val candidates = ArrayList<AccessibilityNodeInfo>()
+    val minTileSize = (40 * resources.displayMetrics.density).toInt()
 
-            while (queue.isNotEmpty()) {
-                val node = queue.removeFirst()
-                val text =
-                    "${node.text ?: ""} ${node.contentDescription ?: ""}".lowercase()
+    for (root in systemRoots()) {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
 
-                if (node.isVisibleToUser && labels.any { text.contains(it) }) {
-                    var cur: AccessibilityNodeInfo? = node
-                    while (cur != null && !cur.isClickable) cur = cur.parent
-                    if (cur != null) candidates.add(cur)
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            val text = textOf(node)
+
+            if (node.isVisibleToUser &&
+                labels.any { label ->
+                    text.contains(label, ignoreCase = true)
+                }
+            ) {
+                var clickable: AccessibilityNodeInfo? = node
+
+                while (clickable != null && !clickable.isClickable) {
+                    clickable = clickable.parent
                 }
 
-                for (i in 0 until node.childCount) {
-                    node.getChild(i)?.let { queue.add(it) }
+                if (clickable != null && clickable.isVisibleToUser) {
+                    val bounds = Rect()
+                    clickable.getBoundsInScreen(bounds)
+
+                    // Reject small status-bar icons and unrelated controls.
+                    if (bounds.width() >= minTileSize &&
+                        bounds.height() >= minTileSize
+                    ) {
+                        candidates.add(clickable)
+                    }
                 }
             }
 
-            if (candidates.isNotEmpty()) break
+            for (i in 0 until node.childCount) {
+                node.getChild(i)?.let { queue.add(it) }
+            }
         }
 
-        // Real Quick Settings tiles can also be long-pressed (to open their
-        // details), unlike status-bar icons that happen to share the name.
-        return candidates.firstOrNull { it.isLongClickable }
-            ?: candidates.firstOrNull()
+        if (candidates.isNotEmpty()) break
     }
+
+    return candidates.firstOrNull { it.isLongClickable }
+        ?: candidates.firstOrNull()
+}
+
 
     // Writes what the panel contained to logcat (tag: HelloBossTiles).
     private fun logPanelLabels(reason: String) {
@@ -395,17 +423,20 @@ class VoiceAccessibilityService : AccessibilityService() {
     // like a finger does. Works on the lock screen, where the global
     // "open Quick Settings" action can end up on the PIN screen.
     private fun swipeDownPanel(): Boolean {
-        val m = resources.displayMetrics
-        val x = m.widthPixels / 2f
 
-        val first = gesture(x, 8f, x, m.heightPixels * 0.55f, 250)
+    val metrics = resources.displayMetrics
+    val x = metrics.widthPixels / 2f
 
-        uiHandler.postDelayed({
-            gesture(x, 8f, x, m.heightPixels * 0.75f, 250)
-        }, 700)
+    Log.i(TILE_TAG, "Opening Quick Settings with lock-screen swipe")
 
-        return first
-    }
+    return gesture(
+        x,
+        5f,
+        x,
+        metrics.heightPixels * 0.75f,
+        350
+    )
+}
 
     // True when the lock screen's PIN / password / pattern entry is showing.
     private fun pinScreenShown(): Boolean {
@@ -428,7 +459,7 @@ class VoiceAccessibilityService : AccessibilityService() {
         dialogLabels: List<String> = emptyList(),
         tapIcon: Boolean = false,
         choices: List<String> = emptyList(),
-        openBySwipe: Boolean = false,
+        openBySwipe: Boolean = true,
         onResult: (TileResult) -> Unit
     ) {
         // On the lock screen, pull the panel down the way a finger does.
@@ -529,43 +560,81 @@ class VoiceAccessibilityService : AccessibilityService() {
     }
 
 
-    // Runs after the tile was tapped: either the tile toggled by itself, or
-    // a dialog opened (Samsung / Pixel Wi-Fi) and its switch must be used.
     private fun afterTileTap(
-        labels: List<String>,
-        desired: Boolean?,
-        dialogLabels: List<String>,
-        clicked: Boolean,
-        before: Boolean?,
-        onResult: (TileResult) -> Unit
-    ) {
-        if (dialogLabels.isNotEmpty()) {
-            val sw = findDialogSwitch(dialogLabels)
+    labels: List<String>,
+    desired: Boolean?,
+    dialogLabels: List<String>,
+    clicked: Boolean,
+    before: Boolean?,
+    onResult: (TileResult) -> Unit
+) {
 
-            if (sw != null) {
-                useDialogSwitch(sw, dialogLabels, desired, onResult)
-                return
-            }
+    if (!clicked) {
+        closePanel()
+        onResult(TileResult.FAILED)
+        return
+    }
 
-            // A dialog opened but its switch could not be identified. Close
-            // the dialog and tap the tile's ICON instead: on Samsung the icon
-            // toggles Wi-Fi directly, while the label opens this dialog.
-            Log.i(TILE_TAG, "No dialog switch; trying the tile icon")
-            tapTileIcon(labels, desired, true, onResult)
+    if (dialogLabels.isNotEmpty()) {
+
+        val sw = findDialogSwitch(dialogLabels)
+
+        if (sw != null) {
+            useDialogSwitch(
+                sw,
+                dialogLabels,
+                desired,
+                onResult
+            )
             return
         }
 
-        // No dialog: the tile itself should have toggled. Read it again.
-        val after = findClickable(labels)?.let { stateOf(it) }
+        Log.i(
+            TILE_TAG,
+            "Dialog switch not found for $labels"
+        )
+
+        tapTileIcon(
+            labels,
+            desired,
+            true,
+            onResult
+        )
+
+        return
+    }
+
+    uiHandler.postDelayed({
+
+        val tile = findClickable(labels)
+        val after = tile?.let { stateOf(it) }
 
         closePanel()
 
-        val failed = !clicked ||
-            (desired != null && after != null && after != desired) ||
-            (desired == null && after != null && after == before)
+        val verified = when {
+            desired != null && after != null ->
+                after == desired
 
-        onResult(if (failed) TileResult.FAILED else TileResult.CHANGED)
-    }
+            desired == null && before != null && after != null ->
+                before != after
+
+            else -> false
+        }
+
+        if (verified) {
+            onResult(TileResult.CHANGED)
+        } else {
+            Log.w(
+                TILE_TAG,
+                "Tile action could not be verified. " +
+                    "before=$before after=$after desired=$desired"
+            )
+
+            onResult(TileResult.FAILED)
+        }
+
+    }, 1000)
+}
 
     // First visible node whose text satisfies the test (or its clickable parent).
     private fun findByText(test: (String) -> Boolean): AccessibilityNodeInfo? {
@@ -630,10 +699,22 @@ class VoiceAccessibilityService : AccessibilityService() {
 
                 closePanel()
 
-                val ok = after == null ||
-                    (after != before && (desired == null || after == desired))
+                val ok = when {
+    after == null -> false
 
-                onResult(if (ok) TileResult.CHANGED else TileResult.FAILED)
+    desired != null ->
+        after == desired
+
+    before != null ->
+        after != before
+
+    else -> false
+}
+
+onResult(
+    if (ok) TileResult.CHANGED
+    else TileResult.FAILED
+)
             }, 900)
         }, 500)
 
@@ -699,11 +780,15 @@ class VoiceAccessibilityService : AccessibilityService() {
 
                 closePanel()
 
-                // If the tile gives no readable state, trust the tap.
-                val ok = tapped && (
-                    after == null ||
-                        (after != before && (desired == null || after == desired))
-                    )
+val ok = tapped && when {
+    desired != null && after != null ->
+        after == desired
+
+    desired == null && before != null && after != null ->
+        before != after
+
+    else -> false
+}
 
                 onResult(if (ok) TileResult.CHANGED else TileResult.FAILED)
             }, 1200)
@@ -737,10 +822,22 @@ class VoiceAccessibilityService : AccessibilityService() {
             performGlobalAction(GLOBAL_ACTION_BACK)
             closePanel()
 
-            val failed = !clicked ||
-                (desired != null && updated != null && updated != desired)
+           val verified = when {
+    !clicked -> false
 
-            onResult(if (failed) TileResult.FAILED else TileResult.CHANGED)
+    desired != null ->
+        updated != null && updated == desired
+
+    current != null && updated != null ->
+        current != updated
+
+    else -> false
+}
+
+onResult(
+    if (verified) TileResult.CHANGED
+    else TileResult.FAILED
+)
         }, 1200)
     }
 
@@ -781,8 +878,28 @@ class VoiceAccessibilityService : AccessibilityService() {
                 Log.i(TILE_TAG, "Page switch clicked: $clicked")
 
                 uiHandler.postDelayed({
-                    onResult(if (clicked) TileResult.CHANGED else TileResult.FAILED)
-                }, 800)
+
+    val updatedSwitch = findPageSwitch(labels)
+    val updated = updatedSwitch?.let { stateOf(it) }
+
+    val verified = when {
+        !clicked -> false
+
+        desired != null ->
+            updated != null && updated == desired
+
+        current != null && updated != null ->
+            current != updated
+
+        else -> false
+    }
+
+    onResult(
+        if (verified) TileResult.CHANGED
+        else TileResult.FAILED
+    )
+
+}, 1000)
             }
         }
 
